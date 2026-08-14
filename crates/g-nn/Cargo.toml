@@ -1,0 +1,12 @@
+[package]
+name = "g-nn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+g-core.workspace = true
+g-cpu.workspace = true
+g-ad.workspace = true

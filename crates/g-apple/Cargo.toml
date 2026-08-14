@@ -1,0 +1,18 @@
+[package]
+name = "g-apple"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+g-core.workspace = true
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSObject", "NSValue"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLCommandQueue", "MTLBuffer", "MTLResource", "MTLTypes"] }
+objc2-metal-performance-shaders = { version = "0.3.2", default-features = false, features = ["std", "MPSCore", "MPSCoreTypes", "MPSNDArray"] }
+objc2-metal-performance-shaders-graph = { version = "0.3.2", default-features = false, features = [
+  "std", "objc2-metal-performance-shaders", "MPSGraph", "MPSGraphCore", "MPSGraphDevice", "MPSGraphExecutable",
+  "MPSGraphOperation", "MPSGraphTensor", "MPSGraphTensorData", "MPSGraphMemoryOps", "MPSGraphMatrixMultiplicationOps"
+] }
