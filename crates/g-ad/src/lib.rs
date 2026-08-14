@@ -1147,6 +1147,57 @@ pub fn take(x: &Tensor, axis: isize, index: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Slice that participates in autodiff (raw [`Tensor::slice`] is a detached
+/// view). Only `f32` for now.
+pub fn slice_tracked(
+    x: &Tensor,
+    ranges: &[(Option<isize>, Option<isize>, Option<isize>)],
+) -> Result<Tensor> {
+    if x.dtype() != Dtype::F32 {
+        return Err(Error::dtype("slice_tracked", "f32 only"));
+    }
+    let y = x.slice(ranges)?;
+    if !x.requires_grad() {
+        return Ok(y);
+    }
+    struct SliceBw {
+        parents: Vec<Tensor>,
+        x_shape: Vec<usize>,
+        ranges: Vec<(Option<isize>, Option<isize>, Option<isize>)>,
+    }
+    impl Backward for SliceBw {
+        fn name(&self) -> &'static str {
+            "slice"
+        }
+        fn parents(&self) -> &[Tensor] {
+            &self.parents
+        }
+        fn backward(&self, gy: &Tensor) -> Result<Vec<Tensor>> {
+            let mut full = Tensor::zeros(&self.x_shape, gy.dtype())?;
+            full.make_unique()?;
+            let view = full.slice(&self.ranges)?;
+            let (voff, vshape, vstrides) =
+                (view.storage_offset(), view.shape().to_vec(), view.strides().to_vec());
+            drop(view);
+            let gyv = gy.to_vec_f32()?;
+            let store = full.as_mut_slice_f32()?;
+            let mut i = 0usize;
+            g_core::for_each_offset(voff, &vshape, &vstrides, |off| {
+                store[off] = gyv[i];
+                i += 1;
+            });
+            Ok(vec![full])
+        }
+    }
+    let mut y = y;
+    y.set_grad_fn(Arc::new(SliceBw {
+        parents: vec![x.clone()],
+        x_shape: x.shape().to_vec(),
+        ranges: ranges.to_vec(),
+    }));
+    Ok(y)
+}
+
 pub fn transpose(x: &Tensor) -> Result<Tensor> {
     let y = x.transpose()?;
     if !x.requires_grad() {

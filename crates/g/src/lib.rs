@@ -33,7 +33,7 @@ pub use g_core::{
 };
 
 #[doc(inline)]
-pub use g_ad::{backward, detach, gated_scan, grad, masked_ce, rms_norm, stop_gradient, zero_grad};
+pub use g_ad::{backward, detach, embedding_fused, gated_scan, grad, masked_ce, rms_norm, slice_tracked, stop_gradient, zero_grad};
 #[doc(inline)]
 pub use g_nn::{
     categorical_entropy, categorical_log_prob, cross_entropy, embedding, layer_norm, linear,

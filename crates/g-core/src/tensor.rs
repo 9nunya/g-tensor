@@ -570,6 +570,9 @@ impl Tensor {
         let mut t = self.clone();
         t.shape = shape;
         t.strides = row_major_strides(&t.shape);
+        t.grad_fn = None;
+        t.leaf = None;
+        t.requires_grad = false;
         Ok(t)
     }
 
@@ -602,6 +605,9 @@ impl Tensor {
         let mut t = self.clone();
         t.shape = new_shape;
         t.strides = new_strides;
+        t.grad_fn = None;
+        t.leaf = None;
+        t.requires_grad = false;
         Ok(t)
     }
 
@@ -676,6 +682,12 @@ impl Tensor {
         t.offset = offset as usize;
         t.shape = shape;
         t.strides = strides;
+        // Views must NOT carry the autodiff tape: a slice of a graph node is a
+        // different tensor with different shape semantics, and aliasing the
+        // node key corrupts the backward pass. Tracked shape ops live in g_ad.
+        t.grad_fn = None;
+        t.leaf = None;
+        t.requires_grad = false;
         Ok(t)
     }
 

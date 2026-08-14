@@ -651,6 +651,12 @@ pub(crate) fn masked_ce_f32(
     let tg = targets.to_vec_i64()?;
     let mk = mask.to_vec_f32()?;
     let n = tg.len();
+    if n * inner != logits.numel() || mk.len() != n {
+        return Err(Error::shape(
+            "masked_ce",
+            format!("targets/mask length {n} inconsistent with logits {}x{inner}", logits.shape()[0]),
+        ));
+    }
     let count: f32 = mk.iter().sum();
     let mut probs = vec![0f32; n * inner];
     par_rows(&mut probs, inner, |r0, blk| {
@@ -699,6 +705,12 @@ pub(crate) fn masked_ce_backward_f32(
     let tg = targets.to_vec_i64()?;
     let mk = mask.to_vec_f32()?;
     let n = tg.len();
+    if n * inner != probs.numel() || mk.len() != n {
+        return Err(Error::shape(
+            "masked_ce_backward",
+            format!("targets/mask length {n} inconsistent with probs {}x{inner}", probs.shape()[0]),
+        ));
+    }
     let count: f32 = mk.iter().sum();
     let mut g = vec![0f32; n * inner];
     if count > 0.0 {
