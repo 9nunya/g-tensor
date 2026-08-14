@@ -6,7 +6,7 @@ use crate::device::Device;
 use crate::dtype::Dtype;
 use crate::error::{Error, ErrorKind, Result};
 use crate::shape::{
-    broadcast_shapes, broadcast_strides, for_each_run, is_contiguous,
+    broadcast_shapes, broadcast_strides, is_contiguous,
     normalize_axis, numel, offset_of, resolve_reshape, row_major_strides,
 };
 use crate::storage::{Storage, StorageData, StorageRef};
@@ -455,10 +455,8 @@ impl Tensor {
         if self.is_contiguous() {
             return Ok(src[self.offset..self.offset + self.numel()].to_vec());
         }
-        let mut out = Vec::with_capacity(self.numel());
-        for_each_run(self.offset, &self.shape, &self.strides, |off, len| {
-            out.extend_from_slice(&src[off..off + len]);
-        });
+        let mut out = vec![Default::default(); self.numel()];
+        crate::shape::strided_copy(src, self.offset, &self.shape, &self.strides, &mut out);
         Ok(out)
     }
 
@@ -471,10 +469,8 @@ impl Tensor {
         if self.is_contiguous() {
             return Ok(src[self.offset..self.offset + self.numel()].to_vec());
         }
-        let mut out = Vec::with_capacity(self.numel());
-        for_each_run(self.offset, &self.shape, &self.strides, |off, len| {
-            out.extend_from_slice(&src[off..off + len]);
-        });
+        let mut out = vec![Default::default(); self.numel()];
+        crate::shape::strided_copy(src, self.offset, &self.shape, &self.strides, &mut out);
         Ok(out)
     }
 
@@ -487,10 +483,8 @@ impl Tensor {
         if self.is_contiguous() {
             return Ok(src[self.offset..self.offset + self.numel()].to_vec());
         }
-        let mut out = Vec::with_capacity(self.numel());
-        for_each_run(self.offset, &self.shape, &self.strides, |off, len| {
-            out.extend_from_slice(&src[off..off + len]);
-        });
+        let mut out = vec![Default::default(); self.numel()];
+        crate::shape::strided_copy(src, self.offset, &self.shape, &self.strides, &mut out);
         Ok(out)
     }
 

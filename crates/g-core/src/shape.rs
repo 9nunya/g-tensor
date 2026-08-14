@@ -273,3 +273,58 @@ pub fn for_each_run(
     let outer_strides = &strides[..split];
     for_each_offset(base, outer_shape, outer_strides, |off| f(off, run));
 }
+
+
+/// Cache-blocked copy of a strided view into a contiguous buffer.
+///
+/// The naive version walked elements in logical order, which for a transposed
+/// matrix means a cache miss per element. Tiling the inner two axes keeps both
+/// the read and write streams in cache.
+pub fn strided_copy<T: Copy + Default>(
+    src: &[T],
+    base: usize,
+    shape: &[usize],
+    strides: &[isize],
+    out: &mut [T],
+) {
+    const TILE: usize = 64;
+    let rank = shape.len();
+    if shape.contains(&0) {
+        return;
+    }
+    if rank == 0 {
+        out[0] = src[base];
+        return;
+    }
+    if rank == 1 {
+        let s = strides[0];
+        for (j, o) in out.iter_mut().enumerate() {
+            *o = src[(base as isize + j as isize * s) as usize];
+        }
+        return;
+    }
+    let inner = shape[rank - 1];
+    let istr = strides[rank - 1];
+    let rows = shape[rank - 2];
+    let rstr = strides[rank - 2];
+    let plane = rows * inner;
+
+    let mut rest: &mut [T] = out;
+    for_each_offset(base, &shape[..rank - 2], &strides[..rank - 2], |off| {
+        let (chunk, tail) = std::mem::take(&mut rest).split_at_mut(plane);
+        for i0 in (0..rows).step_by(TILE) {
+            let imax = (i0 + TILE).min(rows);
+            for j0 in (0..inner).step_by(TILE) {
+                let jmax = (j0 + TILE).min(inner);
+                for i in i0..imax {
+                    let row = off as isize + i as isize * rstr;
+                    let dst = &mut chunk[i * inner..i * inner + inner];
+                    for j in j0..jmax {
+                        dst[j] = src[(row + j as isize * istr) as usize];
+                    }
+                }
+            }
+        }
+        rest = tail;
+    });
+}

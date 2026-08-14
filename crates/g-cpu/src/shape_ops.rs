@@ -23,26 +23,7 @@ pub fn cat(tensors: &[&Tensor], axis: isize) -> Result<Tensor> {
     let mut out_shape = tensors[0].shape().to_vec();
     out_shape[ax] = tensors.iter().map(|t| t.shape()[ax]).sum();
     match dtype {
-        Dtype::F32 => {
-            let mut out = vec![0.0f32; numel(&out_shape)?];
-            let mut cursor = 0usize;
-            for t in tensors {
-                let take = t.shape()[ax];
-                for_each_index(t.shape(), |idx| {
-                    let mut oidx = idx.to_vec();
-                    oidx[ax] += cursor;
-                    let mut off = 0usize;
-                    let mut st = 1usize;
-                    for i in (0..out_shape.len()).rev() {
-                        off += oidx[i] * st;
-                        st *= out_shape[i];
-                    }
-                    out[off] = t.read_f32_at(idx).unwrap();
-                });
-                cursor += take;
-            }
-            Tensor::from_slice_f32(&out, &out_shape)
-        }
+        Dtype::F32 => crate::fast::cat_f32(tensors, ax, &out_shape),
         Dtype::F64 => {
             let mut out = vec![0.0f64; numel(&out_shape)?];
             let mut cursor = 0usize;
@@ -86,34 +67,7 @@ pub fn amax(x: &Tensor, axis: isize, keepdims: bool) -> Result<Tensor> {
         out_shape.remove(ax);
     }
     match x.dtype() {
-        Dtype::F32 => {
-            let mut acc = vec![f32::NEG_INFINITY; numel(&out_shape)?.max(1)];
-            for_each_index(x.shape(), |idx| {
-                let mut oidx = Vec::new();
-                for (i, &ix) in idx.iter().enumerate() {
-                    if i == ax {
-                        if keepdims {
-                            oidx.push(0);
-                        }
-                    } else {
-                        oidx.push(ix);
-                    }
-                }
-                let mut off = 0usize;
-                let mut st = 1usize;
-                if !out_shape.is_empty() {
-                    for i in (0..out_shape.len()).rev() {
-                        off += oidx[i] * st;
-                        st *= out_shape[i];
-                    }
-                }
-                let v = x.read_f32_at(idx).unwrap();
-                if v > acc[off] {
-                    acc[off] = v;
-                }
-            });
-            Tensor::from_slice_f32(&acc, &out_shape)
-        }
+        Dtype::F32 => crate::fast::amax_f32(x, ax, &out_shape),
         Dtype::F64 => {
             let mut acc = vec![f64::NEG_INFINITY; numel(&out_shape)?.max(1)];
             for_each_index(x.shape(), |idx| {

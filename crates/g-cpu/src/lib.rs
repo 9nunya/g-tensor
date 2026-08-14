@@ -53,6 +53,17 @@ mod accelerate {
     }
     pub const ROW: i32 = 101;
     pub const NOTRANS: i32 = 111;
+    pub const TRANS: i32 = 112;
+}
+
+/// Whether this build links Accelerate (AMX/BLAS + vForce).
+pub fn accelerate_enabled() -> bool {
+    cfg!(feature = "accelerate")
+}
+
+/// Number of worker threads the kernels will use.
+pub fn thread_count() -> usize {
+    rayon::current_num_threads()
 }
 
 fn same_device_dtype(op: &'static str, xs: &[&Tensor]) -> Result<(Dtype, g_core::Device)> {
@@ -173,6 +184,16 @@ pub fn tanh(a: &Tensor) -> Result<Tensor> {
 
 pub fn square(a: &Tensor) -> Result<Tensor> {
     mul(a, a)
+}
+
+/// Softmax over the last axis, fused. `f32` only.
+pub fn softmax_last(x: &Tensor) -> Result<Tensor> {
+    fast::softmax_last_f32(x)
+}
+
+/// Log-softmax over the last axis, fused. `f32` only.
+pub fn log_softmax_last(x: &Tensor) -> Result<Tensor> {
+    fast::log_softmax_last_f32(x)
 }
 
 /// Apply a scalar `f32` function elementwise (parallel, contiguous fast path).
@@ -377,8 +398,73 @@ fn gemm_f64(m: usize, n: usize, k: usize, a: &[f64], b: &[f64]) -> Vec<f64> {
     }
 }
 
+
+/// Rank-2 `f32` GEMM that consumes transposed *views* directly.
+///
+/// Matmul backward computes `aᵀ @ gy` and `gy @ bᵀ`. Materializing those
+/// transposes costs a full cache-hostile copy each; BLAS can apply them for
+/// free via its transpose flags, so a transposed view is passed straight
+/// through. Returns `None` when the layout is not a plain row/column-major
+/// rank-2 matrix.
+#[cfg(feature = "accelerate")]
+fn matmul2d_blas(a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
+    // (is_transposed, leading_dim) for a 2-D view, or None if oddly strided.
+    fn layout(t: &Tensor) -> Option<(bool, usize)> {
+        let (sh, st) = (t.shape(), t.strides());
+        let (m, k) = (sh[0], sh[1]);
+        if st[1] == 1 && st[0] == k as isize {
+            Some((false, k.max(1)))
+        } else if st[0] == 1 && st[1] == m as isize {
+            Some((true, m.max(1)))
+        } else {
+            None
+        }
+    }
+    if a.rank() != 2 || b.rank() != 2 || a.dtype() != Dtype::F32 || b.dtype() != Dtype::F32 {
+        return None;
+    }
+    let (ta, lda) = layout(a)?;
+    let (tb, ldb) = layout(b)?;
+    let (m, k, n) = (a.shape()[0], a.shape()[1], b.shape()[1]);
+    if b.shape()[0] != k {
+        return None;
+    }
+    let av = match a.storage_f32() {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    let bv = match b.storage_f32() {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e)),
+    };
+    let mut c = vec![0f32; m * n];
+    unsafe {
+        accelerate::cblas_sgemm(
+            accelerate::ROW,
+            if ta { accelerate::TRANS } else { accelerate::NOTRANS },
+            if tb { accelerate::TRANS } else { accelerate::NOTRANS },
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            av.as_ptr().add(a.storage_offset()),
+            lda as i32,
+            bv.as_ptr().add(b.storage_offset()),
+            ldb as i32,
+            0.0,
+            c.as_mut_ptr(),
+            n as i32,
+        );
+    }
+    Some(Tensor::from_vec_f32(c, &[m, n]))
+}
+
 /// Shape algebra matches the charter/record: reject rank-0; 1-D promotions; batch broadcast.
 pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "accelerate")]
+    if let Some(r) = matmul2d_blas(a, b) {
+        return r;
+    }
     let (dtype, _) = same_device_dtype("matmul", &[a, b])?;
     if !dtype.is_float() {
         return Err(Error::dtype("matmul", "float only"));

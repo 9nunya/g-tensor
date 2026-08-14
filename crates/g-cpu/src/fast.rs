@@ -383,3 +383,173 @@ pub(crate) fn gelu_fwd_bwd(x: &Tensor) -> Result<(Tensor, Tensor)> {
         Tensor::from_vec_f32(d, x.shape())?,
     ))
 }
+
+
+/// Split `out` into row blocks and process them in parallel.
+/// `f(first_row_index, block)` sees whole rows of length `inner`.
+#[inline]
+pub(crate) fn par_rows(out: &mut [f32], inner: usize, f: impl Fn(usize, &mut [f32]) + Sync) {
+    if inner == 0 || out.len() < PAR_MIN {
+        f(0, out);
+        return;
+    }
+    let rows = out.len() / inner;
+    let threads = rayon::current_num_threads().max(1);
+    let rpc = rows.div_ceil(threads).max(1);
+    out.par_chunks_mut(rpc * inner)
+        .enumerate()
+        .for_each(|(c, buf)| f(c * rpc, buf));
+}
+
+/// Borrow `x` as a contiguous f32 slice, materializing only if strided.
+macro_rules! as_contig {
+    ($x:expr, $owned:ident) => {
+        match $x.as_slice_f32() {
+            Ok(s) => s,
+            Err(_) => {
+                $owned = $x.to_vec_f32()?;
+                &$owned
+            }
+        }
+    };
+}
+
+/// Numerically stable softmax over the last axis, fused into one pass per row.
+pub(crate) fn softmax_last_f32(x: &Tensor) -> Result<Tensor> {
+    let rank = x.rank();
+    if rank == 0 {
+        return Err(Error::shape("softmax", "rank-0"));
+    }
+    let inner = x.shape()[rank - 1];
+    let owned;
+    let src = as_contig!(x, owned);
+    let mut out = vec![0f32; x.numel()];
+    par_rows(&mut out, inner, |r0, blk| {
+        for (j, row) in blk.chunks_mut(inner).enumerate() {
+            let s = &src[(r0 + j) * inner..(r0 + j + 1) * inner];
+            let m = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            for (d, &v) in row.iter_mut().zip(s) {
+                *d = v - m;
+            }
+            let p = row.as_ptr();
+            k_exp(unsafe { std::slice::from_raw_parts(p, row.len()) }, row);
+            let sum: f32 = row.iter().copied().sum();
+            let inv = 1.0 / sum;
+            for d in row.iter_mut() {
+                *d *= inv;
+            }
+        }
+    });
+    Tensor::from_vec_f32(out, x.shape())
+}
+
+/// Numerically stable log-softmax over the last axis.
+pub(crate) fn log_softmax_last_f32(x: &Tensor) -> Result<Tensor> {
+    let rank = x.rank();
+    if rank == 0 {
+        return Err(Error::shape("log_softmax", "rank-0"));
+    }
+    let inner = x.shape()[rank - 1];
+    let owned;
+    let src = as_contig!(x, owned);
+    let mut out = vec![0f32; x.numel()];
+    par_rows(&mut out, inner, |r0, blk| {
+        let mut scratch = vec![0f32; inner];
+        for (j, row) in blk.chunks_mut(inner).enumerate() {
+            let s = &src[(r0 + j) * inner..(r0 + j + 1) * inner];
+            let m = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            for (d, &v) in row.iter_mut().zip(s) {
+                *d = v - m;
+            }
+            k_exp(row, &mut scratch);
+            let sum: f32 = scratch.iter().copied().sum();
+            let lse = sum.ln();
+            for d in row.iter_mut() {
+                *d -= lse;
+            }
+        }
+    });
+    Tensor::from_vec_f32(out, x.shape())
+}
+
+/// Max over `ax`. Fast row path when `ax` is the last axis.
+pub(crate) fn amax_f32(x: &Tensor, ax: usize, out_shape: &[usize]) -> Result<Tensor> {
+    let rank = x.rank();
+    let out_n = numel(out_shape)?;
+    if ax == rank - 1 {
+        let inner = x.shape()[rank - 1];
+        let owned;
+        let src = as_contig!(x, owned);
+        let mut out = vec![0f32; out_n];
+        par_chunks(&mut out, |off, dst| {
+            for (j, d) in dst.iter_mut().enumerate() {
+                let r = off + j;
+                *d = src[r * inner..(r + 1) * inner]
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+            }
+        });
+        return Tensor::from_vec_f32(out, out_shape);
+    }
+    // General axis: dual odometer, no per-element allocation.
+    let mut ostr = vec![0isize; rank];
+    let mut st = 1isize;
+    for k in (0..rank).rev() {
+        if k != ax {
+            ostr[k] = st;
+            st *= x.shape()[k] as isize;
+        }
+    }
+    let src = x.storage_f32()?;
+    let shape = x.shape().to_vec();
+    let xstr = x.strides().to_vec();
+    let mut acc = vec![f32::NEG_INFINITY; out_n];
+    let mut idx = vec![0usize; rank];
+    let mut ioff = x.storage_offset() as isize;
+    let mut ooff = 0isize;
+    loop {
+        let v = src[ioff as usize];
+        let slot = &mut acc[ooff as usize];
+        if v > *slot {
+            *slot = v;
+        }
+        let mut k = rank - 1;
+        loop {
+            idx[k] += 1;
+            ioff += xstr[k];
+            ooff += ostr[k];
+            if idx[k] < shape[k] {
+                break;
+            }
+            ioff -= xstr[k] * shape[k] as isize;
+            ooff -= ostr[k] * shape[k] as isize;
+            idx[k] = 0;
+            if k == 0 {
+                return Tensor::from_vec_f32(acc, out_shape);
+            }
+            k -= 1;
+        }
+    }
+}
+
+/// Concatenate along `ax` with contiguous block copies.
+pub(crate) fn cat_f32(tensors: &[&Tensor], ax: usize, out_shape: &[usize]) -> Result<Tensor> {
+    let inner: usize = out_shape[ax + 1..].iter().product();
+    let outer: usize = out_shape[..ax].iter().product();
+    let out_ax = out_shape[ax];
+    let mut out = vec![0f32; numel(out_shape)?];
+    let mut cursor = 0usize;
+    for t in tensors {
+        let owned;
+        let tv = as_contig!(t, owned);
+        let tax = t.shape()[ax];
+        let span = tax * inner;
+        for o in 0..outer {
+            let dst = o * out_ax * inner + cursor * inner;
+            out[dst..dst + span].copy_from_slice(&tv[o * span..o * span + span]);
+        }
+        cursor += tax;
+    }
+    Tensor::from_vec_f32(out, out_shape)
+}

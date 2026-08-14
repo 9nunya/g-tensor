@@ -57,6 +57,11 @@ pub fn mse_loss(pred: &Tensor, target: &Tensor, reduction: Reduce) -> Result<Ten
 
 /// Softmax along `axis`. Compute is at least fp32.
 pub fn softmax(x: &Tensor, axis: isize) -> Result<Tensor> {
+    let axn = g_core::normalize_axis(axis, x.rank(), "softmax")?;
+    if x.dtype() == Dtype::F32 && axn + 1 == x.rank() {
+        let out = g_cpu::softmax_last(x)?;
+        return Ok(track_softmax(x, out));
+    }
     log_softmax(x, axis).and_then(|z| {
         // exp(log_softmax)
         match z.dtype() {
@@ -114,6 +119,20 @@ pub fn log_softmax(x: &Tensor, axis: isize) -> Result<Tensor> {
     if x.shape()[ax] == 0 {
         return Err(Error::shape("log_softmax", "empty axis"));
     }
+    if x.dtype() == Dtype::F32 && ax + 1 == x.rank() {
+        let out = g_cpu::log_softmax_last(x)?;
+        if x.requires_grad() {
+            let mut y = out;
+            let saved = y.detach();
+            y.set_grad_fn(Arc::new(LogSoftmaxBw {
+                parents: vec![x.clone()],
+                log_y: saved,
+                axis: ax,
+            }));
+            return Ok(y);
+        }
+        return Ok(out);
+    }
     // x - max - log(sum(exp(x-max)))
     let maxv = reduce_max(x, ax)?;
     let shifted = g_cpu::sub(x, &maxv)?;
@@ -168,27 +187,7 @@ impl Backward for LogSoftmaxBw {
         &self.parents
     }
     fn backward(&self, gy: &Tensor) -> Result<Vec<Tensor>> {
-        let s = match self.log_y.dtype() {
-            Dtype::F32 => {
-                let v: Vec<f32> = self
-                    .log_y
-                    .to_vec_f32()?
-                    .into_iter()
-                    .map(|v| v.exp())
-                    .collect();
-                Tensor::from_slice_f32(&v, self.log_y.shape())?
-            }
-            Dtype::F64 => {
-                let v: Vec<f64> = self
-                    .log_y
-                    .to_vec_f64()?
-                    .into_iter()
-                    .map(|v| v.exp())
-                    .collect();
-                Tensor::from_slice_f64(&v, self.log_y.shape())?
-            }
-            Dtype::I64 => return Err(Error::dtype("log_softmax", "float")),
-        };
+        let s = g_cpu::exp(&self.log_y)?;
         let sum_gy = g_cpu::sum(gy, Some(&[self.axis as isize]), true)?;
         let corr = g_cpu::mul(&s, &sum_gy)?;
         Ok(vec![g_cpu::sub(gy, &corr)?])
@@ -373,15 +372,18 @@ pub fn nll_loss(log_probs: &Tensor, targets: &Tensor, reduction: Reduce) -> Resu
     let c = log_probs.shape()[1] as i64;
     let gathered = match log_probs.dtype() {
         Dtype::F32 => {
+            let lp = log_probs.to_vec_f32()?;
+            let tg = targets.to_vec_i64()?;
+            let width = log_probs.shape()[1];
             let mut v = Vec::with_capacity(b);
             for i in 0..b {
-                let cls = targets.read_i64_at(&[i])?;
+                let cls = tg[i];
                 if cls < 0 || cls >= c {
                     return Err(Error::index("nll_loss", "class oob"));
                 }
-                v.push(-log_probs.read_f32_at(&[i, cls as usize])?);
+                v.push(-lp[i * width + cls as usize]);
             }
-            Tensor::from_slice_f32(&v, &[b])?
+            Tensor::from_vec_f32(v, &[b])?
         }
         Dtype::F64 => {
             let mut v = Vec::with_capacity(b);
