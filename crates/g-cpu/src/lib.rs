@@ -208,6 +208,16 @@ pub fn argmax_last(x: &Tensor) -> Result<Tensor> {
     fast::argmax_last_f32(x)
 }
 
+/// Sigmoid value + local derivative in one pass. `f32` only.
+pub fn sigmoid_with_grad(x: &Tensor) -> Result<(Tensor, Tensor)> {
+    fast::sigmoid_fwd_bwd(x)
+}
+
+/// SiLU value + local derivative in one pass. `f32` only.
+pub fn silu_with_grad(x: &Tensor) -> Result<(Tensor, Tensor)> {
+    fast::silu_fwd_bwd(x)
+}
+
 /// Backward of the fused embedding lookup (exposed for the AD layer).
 pub fn fast_embedding_backward(table: &Tensor, idx: &Tensor, gy: &Tensor) -> Result<Tensor> {
     fast::embedding_backward_f32(table, idx, gy)
@@ -486,10 +496,84 @@ fn matmul2d_blas(a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
     Some(Tensor::from_vec_f32(c, &[m, n]))
 }
 
+/// Rank-3 `[B, M, K] @ [K, N]` (or `[B, K, N]`) GEMM with optional
+/// transposed views, straight to BLAS with no batch machinery. This is the
+/// exact shape of every linear layer and both of its backward GEMMs, so it
+/// covers nearly all matmuls in training.
+#[cfg(feature = "accelerate")]
+fn matmul3d_blas(a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
+    // Layout of the last two axes of `t`, plus the batch stride.
+    fn layout(t: &Tensor) -> Option<(bool, usize, usize)> {
+        let (sh, st) = (t.shape(), t.strides());
+        let (m, k) = (sh[sh.len() - 2], sh[sh.len() - 1]);
+        let bstride = if sh.len() >= 3 { st[sh.len() - 3] as usize } else { 0 };
+        if st[sh.len() - 1] == 1 && st[sh.len() - 2] == k as isize {
+            Some((false, k.max(1), bstride)) // row-major
+        } else if st[sh.len() - 2] == 1 && st[sh.len() - 1] == m as isize {
+            Some((true, m.max(1), bstride)) // transposed view
+        } else {
+            None
+        }
+    }
+    if a.rank() != 3 || a.dtype() != Dtype::F32 || b.dtype() != Dtype::F32 {
+        return None;
+    }
+    let b3 = if b.rank() == 3 {
+        if b.shape()[0] != a.shape()[0] {
+            return None;
+        }
+        true
+    } else if b.rank() == 2 {
+        false
+    } else {
+        return None;
+    };
+    let (ba, bm, bk) = (a.shape()[0], a.shape()[1], a.shape()[2]);
+    if b.shape()[b.rank() - 2] != bk {
+        return None;
+    }
+    let n = b.shape()[b.rank() - 1];
+    let (ta, lda, astride) = layout(a)?;
+    let (tb, ldb, bstride) = layout(b)?;
+    if astride != bm * bk || (b3 && bstride != bk * n) {
+        return None; // non-contiguous batches: fall back
+    }
+    let av = a.storage_f32().ok()?;
+    let bv = b.storage_f32().ok()?;
+    let mut c = vec![0f32; ba * bm * n];
+    let (aoff, boff) = (a.storage_offset(), b.storage_offset());
+    for bi in 0..ba {
+        let bi_b = if b3 { bi } else { 0 };
+        unsafe {
+            accelerate::cblas_sgemm(
+                accelerate::ROW,
+                if ta { accelerate::TRANS } else { accelerate::NOTRANS },
+                if tb { accelerate::TRANS } else { accelerate::NOTRANS },
+                bm as i32,
+                n as i32,
+                bk as i32,
+                1.0,
+                av.as_ptr().add(aoff + bi * astride),
+                lda as i32,
+                bv.as_ptr().add(boff + bi_b * bstride),
+                ldb as i32,
+                0.0,
+                c.as_mut_ptr().add(bi * bm * n),
+                n as i32,
+            );
+        }
+    }
+    Some(Tensor::from_vec_f32(c, &[ba, bm, n]))
+}
+
 /// Shape algebra matches the charter/record: reject rank-0; 1-D promotions; batch broadcast.
 pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     #[cfg(feature = "accelerate")]
     if let Some(r) = matmul2d_blas(a, b) {
+        return r;
+    }
+    #[cfg(feature = "accelerate")]
+    if let Some(r) = matmul3d_blas(a, b) {
         return r;
     }
     let (dtype, _) = same_device_dtype("matmul", &[a, b])?;

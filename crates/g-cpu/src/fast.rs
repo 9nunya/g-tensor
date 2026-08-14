@@ -546,9 +546,10 @@ pub(crate) fn embedding_f32(table: &Tensor, idx: &Tensor) -> Result<Tensor> {
     let iv = idx.storage_i64()?;
     let shape = idx.shape();
     let mut out = vec![0f32; idx.numel() * inner];
-    par_chunks(&mut out, |off, dst| {
-        for (j, d) in dst.chunks_mut(inner).enumerate() {
-            let class = iv[idx.storage_offset() + off / inner + j];
+    // Row-aligned parallel split: chunks must land on row boundaries.
+    par_rows(&mut out, inner, |r0, blk| {
+        for (j, d) in blk.chunks_mut(inner).enumerate() {
+            let class = iv[idx.storage_offset() + r0 + j];
             if class < 0 || class >= v {
                 d.fill(0.0);
                 continue;
@@ -657,7 +658,9 @@ pub(crate) fn masked_ce_f32(
             format!("targets/mask length {n} inconsistent with logits {}x{inner}", logits.shape()[0]),
         ));
     }
-    let count: f32 = mk.iter().sum();
+    // |mask| normalization: RL passes advantage weights (possibly negative)
+    // through the mask, and the count must stay positive.
+    let count: f32 = mk.iter().map(|m| m.abs()).sum();
     let mut probs = vec![0f32; n * inner];
     par_rows(&mut probs, inner, |r0, blk| {
         let mut scratch = vec![0f32; inner];
@@ -711,7 +714,7 @@ pub(crate) fn masked_ce_backward_f32(
             format!("targets/mask length {n} inconsistent with probs {}x{inner}", probs.shape()[0]),
         ));
     }
-    let count: f32 = mk.iter().sum();
+    let count: f32 = mk.iter().map(|m| m.abs()).sum();
     let mut g = vec![0f32; n * inner];
     if count > 0.0 {
         let inv = 1.0 / count;
@@ -730,4 +733,98 @@ pub(crate) fn masked_ce_backward_f32(
         });
     }
     Tensor::from_vec_f32(g, probs.shape())
+}
+
+
+/// Sigmoid value and local derivative in one pass (training pays one pass
+/// instead of the fwd + a two-pass local + a backward mul).
+pub(crate) fn sigmoid_fwd_bwd(x: &Tensor) -> Result<(Tensor, Tensor)> {
+    let n = x.numel();
+    let owned;
+    let src: &[f32] = match x.as_slice_f32() {
+        Ok(s) => s,
+        Err(_) => {
+            owned = x.to_vec_f32()?;
+            &owned
+        }
+    };
+    let mut y = vec![0f32; n];
+    let mut d = vec![0f32; n];
+    // d <- -x, then vectorized exp via vForce, then the final division —
+    // scalar .exp() in the hot loop is ~10x slower than vvexpf.
+    let body = |src: &[f32], yc: &mut [f32], dc: &mut [f32]| {
+        for (i, &s) in src.iter().enumerate() {
+            dc[i] = -s;
+        }
+        let p = dc.as_ptr();
+        k_exp(unsafe { std::slice::from_raw_parts(p, dc.len()) }, dc);
+        for (i, &s) in src.iter().enumerate() {
+            let v = 1.0 / (1.0 + dc[i]);
+            yc[i] = v;
+            dc[i] = v * (1.0 - v);
+        }
+    };
+    if n < PAR_MIN {
+        body(src, &mut y, &mut d);
+    } else {
+        let threads = rayon::current_num_threads().max(1);
+        let chunk = (n.div_ceil(threads)).max(1024).div_ceil(16) * 16;
+        y.par_chunks_mut(chunk)
+            .zip(d.par_chunks_mut(chunk))
+            .enumerate()
+            .for_each(|(i, (yc, dc))| {
+                let off = i * chunk;
+                body(&src[off..off + yc.len()], yc, dc);
+            });
+    }
+    Ok((
+        Tensor::from_vec_f32(y, x.shape())?,
+        Tensor::from_vec_f32(d, x.shape())?,
+    ))
+}
+
+/// SiLU value and local derivative in one pass (one sigmoid shared between
+/// the value and the derivative).
+pub(crate) fn silu_fwd_bwd(x: &Tensor) -> Result<(Tensor, Tensor)> {
+    let n = x.numel();
+    let owned;
+    let src: &[f32] = match x.as_slice_f32() {
+        Ok(s) => s,
+        Err(_) => {
+            owned = x.to_vec_f32()?;
+            &owned
+        }
+    };
+    let mut y = vec![0f32; n];
+    let mut d = vec![0f32; n];
+    let body = |src: &[f32], yc: &mut [f32], dc: &mut [f32]| {
+        for (i, &s) in src.iter().enumerate() {
+            dc[i] = -s;
+        }
+        let p = dc.as_ptr();
+        k_exp(unsafe { std::slice::from_raw_parts(p, dc.len()) }, dc);
+        for (i, &s) in src.iter().enumerate() {
+            let sg = 1.0 / (1.0 + dc[i]);
+            yc[i] = s * sg;
+            // silu' = sigmoid + x*sigmoid*(1-sigmoid)
+            dc[i] = sg * (1.0 + s - s * sg);
+        }
+    };
+    if n < PAR_MIN {
+        body(src, &mut y, &mut d);
+    } else {
+        let threads = rayon::current_num_threads().max(1);
+        let chunk = (n.div_ceil(threads)).max(1024).div_ceil(16) * 16;
+        y.par_chunks_mut(chunk)
+            .zip(d.par_chunks_mut(chunk))
+            .enumerate()
+            .for_each(|(i, (yc, dc))| {
+                let off = i * chunk;
+                body(&src[off..off + yc.len()], yc, dc);
+            });
+    }
+    Ok((
+        Tensor::from_vec_f32(y, x.shape())?,
+        Tensor::from_vec_f32(d, x.shape())?,
+    ))
 }
