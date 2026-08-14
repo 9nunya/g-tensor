@@ -15,8 +15,8 @@ pub use device::Device;
 pub use dtype::Dtype;
 pub use error::{Error, ErrorKind, Result};
 pub use shape::{
-    broadcast_shapes, broadcast_strides, for_each_index, normalize_axis, numel, offset_of,
-    resolve_reshape, row_major_strides,
+    broadcast_shapes, broadcast_strides, for_each_index, for_each_offset, for_each_run,
+    normalize_axis, numel, offset_of, resolve_reshape, row_major_strides,
 };
 pub use storage::{Storage, StorageData};
 pub use tensor::{Leaf, Tensor};

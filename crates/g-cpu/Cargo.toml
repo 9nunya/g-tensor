@@ -7,8 +7,9 @@ publish.workspace = true
 rust-version.workspace = true
 
 [features]
-default = []
+default = ["accelerate"]
 accelerate = []
 
 [dependencies]
 g-core.workspace = true
+rayon = "1.10"

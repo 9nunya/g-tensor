@@ -6,8 +6,8 @@ use crate::device::Device;
 use crate::dtype::Dtype;
 use crate::error::{Error, ErrorKind, Result};
 use crate::shape::{
-    broadcast_shapes, broadcast_strides, for_each_index, is_contiguous, normalize_axis, numel,
-    offset_of, resolve_reshape, row_major_strides,
+    broadcast_shapes, broadcast_strides, for_each_run, is_contiguous,
+    normalize_axis, numel, offset_of, resolve_reshape, row_major_strides,
 };
 use crate::storage::{Storage, StorageData, StorageRef};
 
@@ -328,14 +328,136 @@ impl Tensor {
         }
     }
 
+    /// Zero-copy view of the underlying `f32` storage.
+    ///
+    /// Succeeds only for contiguous tensors, where storage order already
+    /// matches row-major logical order. Kernels should try this first and fall
+    /// back to a strided gather only when it fails.
+    pub fn as_slice_f32(&self) -> Result<&[f32]> {
+        if self.dtype != Dtype::F32 {
+            return Err(Error::dtype("as_slice", "expected f32"));
+        }
+        if !self.is_contiguous() {
+            return Err(Error::shape("as_slice", "requires a contiguous tensor"));
+        }
+        Ok(&self.storage.f32s()?[self.offset..self.offset + self.numel()])
+    }
+
+    /// Zero-copy view of the underlying `f64` storage. See [`Tensor::as_slice_f32`].
+    pub fn as_slice_f64(&self) -> Result<&[f64]> {
+        if self.dtype != Dtype::F64 {
+            return Err(Error::dtype("as_slice", "expected f64"));
+        }
+        if !self.is_contiguous() {
+            return Err(Error::shape("as_slice", "requires a contiguous tensor"));
+        }
+        Ok(&self.storage.f64s()?[self.offset..self.offset + self.numel()])
+    }
+
+    /// Zero-copy view of the underlying `i64` storage. See [`Tensor::as_slice_f32`].
+    pub fn as_slice_i64(&self) -> Result<&[i64]> {
+        if self.dtype != Dtype::I64 {
+            return Err(Error::dtype("as_slice", "expected i64"));
+        }
+        if !self.is_contiguous() {
+            return Err(Error::shape("as_slice", "requires a contiguous tensor"));
+        }
+        Ok(&self.storage.i64s()?[self.offset..self.offset + self.numel()])
+    }
+
+    /// Offset of this view's first element within its storage. For kernels.
+    pub fn storage_offset(&self) -> usize {
+        self.offset
+    }
+
+    /// The whole backing `f32` storage, ignoring offset and strides.
+    ///
+    /// Kernels combine this with [`Tensor::storage_offset`] and
+    /// [`Tensor::strides`] to read arbitrary strided views without copying.
+    pub fn storage_f32(&self) -> Result<&[f32]> {
+        if self.dtype != Dtype::F32 {
+            return Err(Error::dtype("storage_f32", "expected f32"));
+        }
+        self.storage.f32s()
+    }
+
+    /// The whole backing `i64` storage, ignoring offset and strides.
+    pub fn storage_i64(&self) -> Result<&[i64]> {
+        if self.dtype != Dtype::I64 {
+            return Err(Error::dtype("storage_i64", "expected i64"));
+        }
+        self.storage.i64s()
+    }
+
+    /// Build an `f32` tensor by *moving* `data` in, with no copy.
+    pub fn from_vec_f32(data: Vec<f32>, shape: &[usize]) -> Result<Self> {
+        let n = numel(shape)?;
+        if data.len() != n {
+            return Err(Error::shape(
+                "from_vec",
+                format!("len {} != numel {n}", data.len()),
+            ));
+        }
+        Self::from_storage(
+            Storage {
+                data: StorageData::F32(data),
+            },
+            shape.to_vec(),
+            Dtype::F32,
+            Device::Cpu,
+        )
+    }
+
+    /// Build an `f64` tensor by *moving* `data` in, with no copy.
+    pub fn from_vec_f64(data: Vec<f64>, shape: &[usize]) -> Result<Self> {
+        let n = numel(shape)?;
+        if data.len() != n {
+            return Err(Error::shape(
+                "from_vec",
+                format!("len {} != numel {n}", data.len()),
+            ));
+        }
+        Self::from_storage(
+            Storage {
+                data: StorageData::F64(data),
+            },
+            shape.to_vec(),
+            Dtype::F64,
+            Device::Cpu,
+        )
+    }
+
+    /// Build an `i64` tensor by *moving* `data` in, with no copy.
+    pub fn from_vec_i64(data: Vec<i64>, shape: &[usize]) -> Result<Self> {
+        let n = numel(shape)?;
+        if data.len() != n {
+            return Err(Error::shape(
+                "from_vec",
+                format!("len {} != numel {n}", data.len()),
+            ));
+        }
+        Self::from_storage(
+            Storage {
+                data: StorageData::I64(data),
+            },
+            shape.to_vec(),
+            Dtype::I64,
+            Device::Cpu,
+        )
+    }
+
     /// Pack values as row-major `f32`. Named CPU sync.
     pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
         if self.dtype != Dtype::F32 {
             return Err(Error::dtype("to_vec", "expected f32"));
         }
+        let src = self.storage.f32s()?;
+        if self.is_contiguous() {
+            return Ok(src[self.offset..self.offset + self.numel()].to_vec());
+        }
         let mut out = Vec::with_capacity(self.numel());
-        for_each_index(&self.shape, |idx| {
-            out.push(self.read_f32_at(idx).unwrap());
+        for_each_run(self.offset, &self.shape, &self.strides, |off, len| {
+            out.extend_from_slice(&src[off..off + len]);
         });
         Ok(out)
     }
@@ -345,9 +467,13 @@ impl Tensor {
         if self.dtype != Dtype::F64 {
             return Err(Error::dtype("to_vec", "expected f64"));
         }
+        let src = self.storage.f64s()?;
+        if self.is_contiguous() {
+            return Ok(src[self.offset..self.offset + self.numel()].to_vec());
+        }
         let mut out = Vec::with_capacity(self.numel());
-        for_each_index(&self.shape, |idx| {
-            out.push(self.read_f64_at(idx).unwrap());
+        for_each_run(self.offset, &self.shape, &self.strides, |off, len| {
+            out.extend_from_slice(&src[off..off + len]);
         });
         Ok(out)
     }
@@ -357,9 +483,13 @@ impl Tensor {
         if self.dtype != Dtype::I64 {
             return Err(Error::dtype("to_vec", "expected i64"));
         }
+        let src = self.storage.i64s()?;
+        if self.is_contiguous() {
+            return Ok(src[self.offset..self.offset + self.numel()].to_vec());
+        }
         let mut out = Vec::with_capacity(self.numel());
-        for_each_index(&self.shape, |idx| {
-            out.push(self.read_i64_at(idx).unwrap());
+        for_each_run(self.offset, &self.shape, &self.strides, |off, len| {
+            out.extend_from_slice(&src[off..off + len]);
         });
         Ok(out)
     }
@@ -388,9 +518,9 @@ impl Tensor {
             return Ok(self.clone());
         }
         match self.dtype {
-            Dtype::F32 => Self::from_slice_f32(&self.to_vec_f32()?, &self.shape),
-            Dtype::F64 => Self::from_slice_f64(&self.to_vec_f64()?, &self.shape),
-            Dtype::I64 => Self::from_slice_i64(&self.to_vec_i64()?, &self.shape),
+            Dtype::F32 => Self::from_vec_f32(self.to_vec_f32()?, &self.shape),
+            Dtype::F64 => Self::from_vec_f64(self.to_vec_f64()?, &self.shape),
+            Dtype::I64 => Self::from_vec_i64(self.to_vec_i64()?, &self.shape),
         }
     }
 

@@ -5,6 +5,7 @@ use g_core::{
     Tensor,
 };
 
+mod fast;
 mod shape_ops;
 mod unary;
 
@@ -110,14 +111,23 @@ where
 }
 
 pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if a.dtype() == Dtype::F32 && b.dtype() == Dtype::F32 {
+        return fast::binary_f32("add", a, b, |x, y| x + y);
+    }
     binary_float("add", a, b, |x, y| x + y, |x, y| x + y)
 }
 
 pub fn sub(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if a.dtype() == Dtype::F32 && b.dtype() == Dtype::F32 {
+        return fast::binary_f32("sub", a, b, |x, y| x - y);
+    }
     binary_float("sub", a, b, |x, y| x - y, |x, y| x - y)
 }
 
 pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if a.dtype() == Dtype::F32 && b.dtype() == Dtype::F32 {
+        return fast::binary_f32("mul", a, b, |x, y| x * y);
+    }
     binary_float("mul", a, b, |x, y| x * y, |x, y| x * y)
 }
 
@@ -125,8 +135,7 @@ pub fn mul_scalar(a: &Tensor, s: f64) -> Result<Tensor> {
     match a.dtype() {
         Dtype::F32 => {
             let sf = s as f32;
-            let v: Vec<f32> = a.to_vec_f32()?.into_iter().map(|x| x * sf).collect();
-            Tensor::from_slice_f32(&v, a.shape())
+            fast::map_f32(a, move |x| x * sf)
         }
         Dtype::F64 => {
             let v: Vec<f64> = a.to_vec_f64()?.into_iter().map(|x| x * s).collect();
@@ -142,10 +151,7 @@ pub fn neg(a: &Tensor) -> Result<Tensor> {
 
 pub fn relu(a: &Tensor) -> Result<Tensor> {
     match a.dtype() {
-        Dtype::F32 => {
-            let v: Vec<f32> = a.to_vec_f32()?.into_iter().map(|x| x.max(0.0)).collect();
-            Tensor::from_slice_f32(&v, a.shape())
-        }
+        Dtype::F32 => fast::map_f32(a, |x| x.max(0.0)),
         Dtype::F64 => {
             let v: Vec<f64> = a.to_vec_f64()?.into_iter().map(|x| x.max(0.0)).collect();
             Tensor::from_slice_f64(&v, a.shape())
@@ -156,10 +162,7 @@ pub fn relu(a: &Tensor) -> Result<Tensor> {
 
 pub fn tanh(a: &Tensor) -> Result<Tensor> {
     match a.dtype() {
-        Dtype::F32 => {
-            let v: Vec<f32> = a.to_vec_f32()?.into_iter().map(|x| x.tanh()).collect();
-            Tensor::from_slice_f32(&v, a.shape())
-        }
+        Dtype::F32 => fast::unary_f32(a, fast::k_tanh),
         Dtype::F64 => {
             let v: Vec<f64> = a.to_vec_f64()?.into_iter().map(|x| x.tanh()).collect();
             Tensor::from_slice_f64(&v, a.shape())
@@ -170,6 +173,22 @@ pub fn tanh(a: &Tensor) -> Result<Tensor> {
 
 pub fn square(a: &Tensor) -> Result<Tensor> {
     mul(a, a)
+}
+
+/// Apply a scalar `f32` function elementwise (parallel, contiguous fast path).
+pub fn map_f32(x: &Tensor, f: impl Fn(f32) -> f32 + Sync) -> Result<Tensor> {
+    if x.dtype() != Dtype::F32 {
+        return Err(Error::dtype("map_f32", "f32 only"));
+    }
+    fast::map_f32(x, f)
+}
+
+/// GELU value and local derivative in one pass. `f32` only.
+pub fn gelu_with_grad(x: &Tensor) -> Result<(Tensor, Tensor)> {
+    if x.dtype() != Dtype::F32 {
+        return Err(Error::dtype("gelu_with_grad", "f32 only"));
+    }
+    fast::gelu_fwd_bwd(x)
 }
 
 fn reduce_axes(shape: &[usize], axes: &[usize], keepdims: bool) -> Result<Vec<usize>> {
@@ -219,35 +238,7 @@ pub fn sum(x: &Tensor, axes: Option<&[isize]>, keepdims: bool) -> Result<Tensor>
         r
     };
     match x.dtype() {
-        Dtype::F32 => {
-            let mut acc = vec![0.0f32; numel(&out_shape)?];
-            for_each_index(x.shape(), |idx| {
-                let mut oidx = Vec::new();
-                for (i, &ix) in idx.iter().enumerate() {
-                    if reduced[i] {
-                        if keepdims {
-                            oidx.push(0);
-                        }
-                    } else {
-                        oidx.push(ix);
-                    }
-                }
-                let o = if out_shape.is_empty() {
-                    0
-                } else {
-                    // row-major of out_shape
-                    let mut off = 0usize;
-                    let mut st = 1usize;
-                    for i in (0..out_shape.len()).rev() {
-                        off += oidx[i] * st;
-                        st *= out_shape[i];
-                    }
-                    off
-                };
-                acc[o] += x.read_f32_at(idx).unwrap();
-            });
-            Tensor::from_slice_f32(&acc, &out_shape)
-        }
+        Dtype::F32 => fast::sum_f32(x, &reduced, &out_shape),
         Dtype::F64 => {
             let mut acc = vec![0.0f64; numel(&out_shape)?];
             for_each_index(x.shape(), |idx| {
@@ -314,8 +305,7 @@ pub fn mean(x: &Tensor, axes: Option<&[isize]>, keepdims: bool) -> Result<Tensor
     }
 }
 
-fn gemm_f32(m: usize, n: usize, k: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
-    let mut c = vec![0.0f32; m * n];
+fn gemm_f32_into(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     #[cfg(feature = "accelerate")]
     unsafe {
         accelerate::cblas_sgemm(
@@ -334,10 +324,12 @@ fn gemm_f32(m: usize, n: usize, k: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
             c.as_mut_ptr(),
             n as i32,
         );
-        return c;
     }
     #[cfg(not(feature = "accelerate"))]
     {
+        for v in c.iter_mut() {
+            *v = 0.0;
+        }
         for i in 0..m {
             for p in 0..k {
                 let av = a[i * k + p];
@@ -346,7 +338,6 @@ fn gemm_f32(m: usize, n: usize, k: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
                 }
             }
         }
-        c
     }
 }
 
@@ -424,25 +415,25 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let b_mat = b_b.to_contiguous()?;
     match dtype {
         Dtype::F32 => {
-            let av = a_mat.to_vec_f32()?;
-            let bv = b_mat.to_vec_f32()?;
+            let av = a_mat.as_slice_f32()?;
+            let bv = b_mat.as_slice_f32()?;
             let a_stride = m * k;
             let b_stride = k * n;
             let mut cv = vec![0.0f32; n_batch * m * n];
             for bi in 0..n_batch {
                 let a_i = batch_index_to_src(bi, &batch, a_batch);
                 let b_i = batch_index_to_src(bi, &batch, b_batch);
-                let tile = gemm_f32(
+                let off = bi * m * n;
+                gemm_f32_into(
                     m,
                     n,
                     k,
                     &av[a_i * a_stride..a_i * a_stride + a_stride],
                     &bv[b_i * b_stride..b_i * b_stride + b_stride],
+                    &mut cv[off..off + m * n],
                 );
-                let off = bi * m * n;
-                cv[off..off + m * n].copy_from_slice(&tile);
             }
-            let mut out = Tensor::from_slice_f32(&cv, &out_shape)?;
+            let mut out = Tensor::from_vec_f32(cv, &out_shape)?;
             squeeze_matmul(&mut out, a_squeeze, b_squeeze);
             Ok(out)
         }

@@ -281,6 +281,9 @@ fn unbroadcast(g: &Tensor, target: &[usize]) -> Result<Tensor> {
 }
 
 pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if !any_grad(&[a, b]) {
+        return g_cpu::add(a, b);
+    }
     let out = g_cpu::add(a, b)?;
     Ok(maybe_track(
         out,
@@ -294,6 +297,9 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 }
 
 pub fn sub(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if !any_grad(&[a, b]) {
+        return g_cpu::sub(a, b);
+    }
     let out = g_cpu::sub(a, b)?;
     Ok(maybe_track(
         out,
@@ -307,6 +313,9 @@ pub fn sub(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 }
 
 pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if !any_grad(&[a, b]) {
+        return g_cpu::mul(a, b);
+    }
     let out = g_cpu::mul(a, b)?;
     Ok(maybe_track(
         out,
@@ -333,6 +342,9 @@ pub fn neg(a: &Tensor) -> Result<Tensor> {
 }
 
 pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    if !any_grad(&[a, b]) {
+        return g_cpu::matmul(a, b);
+    }
     let out = g_cpu::matmul(a, b)?;
     Ok(maybe_track(
         out,
@@ -346,6 +358,9 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 }
 
 pub fn relu(a: &Tensor) -> Result<Tensor> {
+    if !a.requires_grad() {
+        return g_cpu::relu(a);
+    }
     let out = g_cpu::relu(a)?;
     Ok(maybe_track(
         out,
@@ -358,6 +373,9 @@ pub fn relu(a: &Tensor) -> Result<Tensor> {
 }
 
 pub fn tanh(a: &Tensor) -> Result<Tensor> {
+    if !a.requires_grad() {
+        return g_cpu::tanh(a);
+    }
     let out = g_cpu::tanh(a)?;
     let saved = out.detach();
     Ok(maybe_track(
@@ -676,18 +694,27 @@ pub fn div(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 }
 
 pub fn exp(x: &Tensor) -> Result<Tensor> {
+    if !x.requires_grad() {
+        return g_cpu::exp(x);
+    }
     let y = g_cpu::exp(x)?;
     let saved = y.detach();
     Ok(unary_track("exp", x, y, saved))
 }
 
 pub fn log(x: &Tensor) -> Result<Tensor> {
+    if !x.requires_grad() {
+        return g_cpu::log(x);
+    }
     let y = g_cpu::log(x)?;
     let inv = g_cpu::div(&Tensor::ones(x.shape(), x.dtype())?, &x.detach())?;
     Ok(unary_track("log", x, y, inv))
 }
 
 pub fn sqrt(x: &Tensor) -> Result<Tensor> {
+    if !x.requires_grad() {
+        return g_cpu::sqrt(x);
+    }
     let y = g_cpu::sqrt(x)?;
     // 0.5 / sqrt(x)
     let half = g_cpu::mul_scalar(
@@ -698,11 +725,17 @@ pub fn sqrt(x: &Tensor) -> Result<Tensor> {
 }
 
 pub fn abs(x: &Tensor) -> Result<Tensor> {
+    if !x.requires_grad() {
+        return g_cpu::abs(x);
+    }
     let y = g_cpu::abs(x)?;
     Ok(unary_track("abs", x, y, g_cpu::sign(&x.detach())?))
 }
 
 pub fn sigmoid(x: &Tensor) -> Result<Tensor> {
+    if !x.requires_grad() {
+        return g_cpu::sigmoid(x);
+    }
     let y = g_cpu::sigmoid(x)?;
     // y * (1-y)
     let ones = Tensor::ones(y.shape(), y.dtype())?;
@@ -711,6 +744,9 @@ pub fn sigmoid(x: &Tensor) -> Result<Tensor> {
 }
 
 pub fn silu(x: &Tensor) -> Result<Tensor> {
+    if !x.requires_grad() {
+        return g_cpu::silu(x);
+    }
     let y = g_cpu::silu(x)?;
     // silu' = sigmoid + x*sigmoid*(1-sigmoid)
     let s = g_cpu::sigmoid(&x.detach())?;
@@ -723,61 +759,52 @@ pub fn silu(x: &Tensor) -> Result<Tensor> {
 }
 
 pub fn gelu(x: &Tensor) -> Result<Tensor> {
+    if !x.requires_grad() {
+        return g_cpu::gelu(x);
+    }
+    if x.dtype() == Dtype::F32 {
+        // Fused: one pass, one vectorized tanh, both value and local derivative.
+        let (y, local) = g_cpu::gelu_with_grad(&x.detach())?;
+        return Ok(unary_track("gelu", x, y, local));
+    }
     let y = g_cpu::gelu(x)?;
-    // finite local via saved is messy; use a cheap FD-free approx derivative of tanh-GELU
     let xd = x.detach();
     let k = (2.0f64 / std::f64::consts::PI).sqrt();
-    let u = match xd.dtype() {
-        Dtype::F32 => {
-            let v: Vec<f32> = xd
-                .to_vec_f32()?
-                .into_iter()
-                .map(|t| {
-                    let inner = t + 0.044715 * t * t * t;
-                    let z = (k as f32) * inner;
-                    let th = z.tanh();
-                    let sech2 = 1.0 - th * th;
-                    let inner_d = 1.0 + 3.0 * 0.044715 * t * t;
-                    0.5 * (1.0 + th) + 0.5 * t * sech2 * (k as f32) * inner_d
-                })
-                .collect();
-            Tensor::from_slice_f32(&v, xd.shape())?
-        }
-        Dtype::F64 => {
-            let v: Vec<f64> = xd
-                .to_vec_f64()?
-                .into_iter()
-                .map(|t| {
-                    let inner = t + 0.044715 * t * t * t;
-                    let z = k * inner;
-                    let th = z.tanh();
-                    let sech2 = 1.0 - th * th;
-                    let inner_d = 1.0 + 3.0 * 0.044715 * t * t;
-                    0.5 * (1.0 + th) + 0.5 * t * sech2 * k * inner_d
-                })
-                .collect();
-            Tensor::from_slice_f64(&v, xd.shape())?
-        }
-        Dtype::I64 => return Err(Error::dtype("gelu", "float")),
+    let u = {
+        let v: Vec<f64> = xd
+            .to_vec_f64()?
+            .into_iter()
+            .map(|t| {
+                let inner = t + 0.044715 * t * t * t;
+                let z = k * inner;
+                let th = z.tanh();
+                let sech2 = 1.0 - th * th;
+                let inner_d = 1.0 + 3.0 * 0.044715 * t * t;
+                0.5 * (1.0 + th) + 0.5 * t * sech2 * k * inner_d
+            })
+            .collect();
+        Tensor::from_vec_f64(v, xd.shape())?
     };
     Ok(unary_track("gelu", x, y, u))
 }
 
 pub fn softplus(x: &Tensor) -> Result<Tensor> {
+    if !x.requires_grad() {
+        return g_cpu::softplus(x);
+    }
     let y = g_cpu::softplus(x)?;
     Ok(unary_track("softplus", x, y, g_cpu::sigmoid(&x.detach())?))
 }
 
 pub fn leaky_relu(x: &Tensor, slope: f64) -> Result<Tensor> {
+    if !x.requires_grad() {
+        return g_cpu::leaky_relu(x, slope);
+    }
     let y = g_cpu::leaky_relu(x, slope)?;
     let local = match x.dtype() {
         Dtype::F32 => {
-            let v: Vec<f32> = x
-                .to_vec_f32()?
-                .into_iter()
-                .map(|t| if t >= 0.0 { 1.0 } else { slope as f32 })
-                .collect();
-            Tensor::from_slice_f32(&v, x.shape())?
+            let sf = slope as f32;
+            g_cpu::map_f32(x, move |t| if t >= 0.0 { 1.0 } else { sf })?
         }
         Dtype::F64 => {
             let v: Vec<f64> = x
@@ -793,6 +820,9 @@ pub fn leaky_relu(x: &Tensor, slope: f64) -> Result<Tensor> {
 }
 
 pub fn clamp(x: &Tensor, min: f64, max: f64) -> Result<Tensor> {
+    if !x.requires_grad() {
+        return g_cpu::clamp(x, min, max);
+    }
     let y = g_cpu::clamp(x, min, max)?;
     let local = match x.dtype() {
         Dtype::F32 => {

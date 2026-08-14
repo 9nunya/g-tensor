@@ -22,3 +22,4 @@ g-cpu = { path = "crates/g-cpu" }
 g-ad = { path = "crates/g-ad" }
 g-nn = { path = "crates/g-nn" }
 g-apple = { path = "crates/g-apple" }
+rayon = "1.10"

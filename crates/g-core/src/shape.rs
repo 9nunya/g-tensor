@@ -197,3 +197,79 @@ mod tests {
         );
     }
 }
+
+
+/// Iterate row-major over `shape`, yielding the *storage offset* of each element.
+///
+/// Unlike [`for_each_index`] this keeps a running offset (odometer) instead of
+/// recomputing `offset_of` per element, and never allocates inside the loop.
+pub fn for_each_offset(base: usize, shape: &[usize], strides: &[isize], mut f: impl FnMut(usize)) {
+    if shape.contains(&0) {
+        return;
+    }
+    if shape.is_empty() {
+        f(base);
+        return;
+    }
+    let rank = shape.len();
+    let mut idx = vec![0usize; rank];
+    let mut off = base as isize;
+    loop {
+        f(off as usize);
+        let mut k = rank - 1;
+        loop {
+            idx[k] += 1;
+            off += strides[k];
+            if idx[k] < shape[k] {
+                break;
+            }
+            off -= strides[k] * shape[k] as isize;
+            idx[k] = 0;
+            if k == 0 {
+                return;
+            }
+            k -= 1;
+        }
+    }
+}
+
+/// Split a logical shape/stride pair into contiguous inner "runs".
+///
+/// Calls `f(start_offset, run_len)` for each maximal run of elements that are
+/// unit-stride in storage, so callers can use slice-level (auto-vectorized)
+/// inner loops instead of per-element stride math.
+pub fn for_each_run(
+    base: usize,
+    shape: &[usize],
+    strides: &[isize],
+    mut f: impl FnMut(usize, usize),
+) {
+    if shape.contains(&0) {
+        return;
+    }
+    if shape.is_empty() {
+        f(base, 1);
+        return;
+    }
+    let rank = shape.len();
+    // Trailing dims with unit stride collapse into one contiguous run.
+    let mut run = 1usize;
+    let mut split = rank;
+    let mut expect: isize = 1;
+    for k in (0..rank).rev() {
+        if strides[k] == expect && shape[k] > 0 {
+            run *= shape[k];
+            expect *= shape[k] as isize;
+            split = k;
+        } else {
+            break;
+        }
+    }
+    if split == 0 {
+        f(base, run);
+        return;
+    }
+    let outer_shape = &shape[..split];
+    let outer_strides = &strides[..split];
+    for_each_offset(base, outer_shape, outer_strides, |off| f(off, run));
+}
