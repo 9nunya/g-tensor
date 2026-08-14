@@ -1257,3 +1257,146 @@ mod tests {
         assert_eq!(g[0].item_f32().unwrap(), 0.0);
     }
 }
+
+
+struct ScanBw {
+    parents: Vec<Tensor>,
+    a: Tensor,
+    h: Tensor,
+}
+impl Backward for ScanBw {
+    fn name(&self) -> &'static str {
+        "gated_scan"
+    }
+    fn parents(&self) -> &[Tensor] {
+        &self.parents
+    }
+    fn backward(&self, gy: &Tensor) -> Result<Vec<Tensor>> {
+        let (ga, gb) = g_cpu::gated_scan_backward(&self.a, &self.h, gy)?;
+        Ok(vec![ga, gb])
+    }
+}
+
+/// Gated linear recurrence `h_t = a_t * h_{t-1} + b_t` over `[B, T, D]`.
+///
+/// One fused op with a hand-written backward, so a length-`T` recurrence costs
+/// a single autodiff node instead of `T` of them.
+pub fn gated_scan(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let h = g_cpu::gated_scan(a, b)?;
+    if !any_grad(&[a, b]) {
+        return Ok(h);
+    }
+    let mut y = h;
+    let saved = y.detach();
+    y.set_grad_fn(Arc::new(ScanBw {
+        parents: vec![a.clone(), b.clone()],
+        a: a.detach(),
+        h: saved,
+    }));
+    Ok(y)
+}
+
+struct RmsBw {
+    parents: Vec<Tensor>,
+    x: Tensor,
+    eps: f32,
+}
+impl Backward for RmsBw {
+    fn name(&self) -> &'static str {
+        "rms_norm"
+    }
+    fn parents(&self) -> &[Tensor] {
+        &self.parents
+    }
+    fn backward(&self, gy: &Tensor) -> Result<Vec<Tensor>> {
+        Ok(vec![g_cpu::rms_norm_backward(&self.x, gy, self.eps)?])
+    }
+}
+
+/// RMS normalization over the last axis, fused.
+pub fn rms_norm(x: &Tensor, eps: f32) -> Result<Tensor> {
+    if !x.requires_grad() {
+        return g_cpu::rms_norm(x, eps);
+    }
+    let mut y = g_cpu::rms_norm(x, eps)?;
+    y.set_grad_fn(Arc::new(RmsBw {
+        parents: vec![x.clone()],
+        x: x.detach(),
+        eps,
+    }));
+    Ok(y)
+}
+
+struct EmbeddingBw {
+    parents: Vec<Tensor>,
+    table: Tensor,
+    idx: Tensor,
+}
+impl Backward for EmbeddingBw {
+    fn name(&self) -> &'static str {
+        "embedding_fused"
+    }
+    fn parents(&self) -> &[Tensor] {
+        &self.parents
+    }
+    fn backward(&self, gy: &Tensor) -> Result<Vec<Tensor>> {
+        let gt = g_cpu::fast_embedding_backward(&self.table, &self.idx, gy)?;
+        Ok(vec![unbroadcast(&gt, self.table.shape())?])
+    }
+}
+
+/// Fused embedding lookup: one node instead of a gather per token.
+pub fn embedding_fused(table: &Tensor, idx: &Tensor) -> Result<Tensor> {
+    let out = g_cpu::embedding(table, idx)?;
+    if !table.requires_grad() {
+        return Ok(out);
+    }
+    let mut y = out;
+    y.set_grad_fn(Arc::new(EmbeddingBw {
+        parents: vec![table.clone()],
+        table: table.detach(),
+        idx: idx.detach(),
+    }));
+    Ok(y)
+}
+
+struct MaskedCeBw {
+    parents: Vec<Tensor>,
+    probs: Tensor,
+    targets: Tensor,
+    mask: Tensor,
+}
+impl Backward for MaskedCeBw {
+    fn name(&self) -> &'static str {
+        "masked_ce"
+    }
+    fn parents(&self) -> &[Tensor] {
+        &self.parents
+    }
+    fn backward(&self, gy: &Tensor) -> Result<Vec<Tensor>> {
+        let g = g_cpu::masked_ce_backward(&self.probs, &self.targets, &self.mask)?;
+        // gy is the scalar dL/dloss; multiply through.
+        let s = gy.to_vec_f32()?[0];
+        Ok(vec![g_cpu::mul_scalar(&g, s as f64)?])
+    }
+}
+
+/// Masked cross-entropy as a single autodiff node.
+///
+/// `logits` is `[N, V]`, `targets` `[N]` (i64), `mask` `[N]` (f32, 1.0 =
+/// scored). Positions with mask 0 contribute nothing to loss or gradient, so
+/// one loss function covers context-heavy samples (observations are masked).
+pub fn masked_ce(logits: &Tensor, targets: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    let (loss, probs) = g_cpu::masked_ce(logits, targets, mask)?;
+    if !logits.requires_grad() {
+        return Ok(loss);
+    }
+    let mut y = loss;
+    y.set_grad_fn(Arc::new(MaskedCeBw {
+        parents: vec![logits.clone()],
+        probs,
+        targets: targets.detach(),
+        mask: mask.detach(),
+    }));
+    Ok(y)
+}

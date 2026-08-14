@@ -6,9 +6,11 @@ use g_core::{
 };
 
 mod fast;
+mod scan;
 mod shape_ops;
 mod unary;
 
+pub use scan::{gated_scan, gated_scan_backward, rms_norm, rms_norm_backward};
 pub use shape_ops::{amax, cat, stack};
 pub use unary::{
     abs, clamp, div, exp, gelu, leaky_relu, log, pow_scalar, sigmoid, sign, silu, softplus, sqrt,
@@ -184,6 +186,31 @@ pub fn tanh(a: &Tensor) -> Result<Tensor> {
 
 pub fn square(a: &Tensor) -> Result<Tensor> {
     mul(a, a)
+}
+
+/// Fused embedding lookup with hand-written backward. `f32` table.
+pub fn embedding(table: &Tensor, idx: &Tensor) -> Result<Tensor> {
+    fast::embedding_f32(table, idx)
+}
+
+/// Masked cross-entropy: `-mean(mask * log p[target])`. Returns `(loss, probs)`.
+pub fn masked_ce(logits: &Tensor, targets: &Tensor, mask: &Tensor) -> Result<(Tensor, Tensor)> {
+    fast::masked_ce_f32(logits, targets, mask)
+}
+
+/// Backward of [`masked_ce`].
+pub fn masked_ce_backward(probs: &Tensor, targets: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    fast::masked_ce_backward_f32(probs, targets, mask)
+}
+
+/// Argmax over the last axis -> i64 indices. `f32` input.
+pub fn argmax_last(x: &Tensor) -> Result<Tensor> {
+    fast::argmax_last_f32(x)
+}
+
+/// Backward of the fused embedding lookup (exposed for the AD layer).
+pub fn fast_embedding_backward(table: &Tensor, idx: &Tensor, gy: &Tensor) -> Result<Tensor> {
+    fast::embedding_backward_f32(table, idx, gy)
 }
 
 /// Softmax over the last axis, fused. `f32` only.

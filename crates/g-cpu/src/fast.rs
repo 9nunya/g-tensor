@@ -11,7 +11,7 @@
 //!   3. work splitting across cores above a size threshold,
 //!   4. Accelerate vForce for transcendentals (exp/log/tanh/sqrt).
 
-use g_core::{broadcast_shapes, broadcast_strides, numel, Error, Result, Tensor};
+use g_core::{broadcast_shapes, broadcast_strides, numel, Dtype, Error, Result, Tensor};
 use rayon::prelude::*;
 
 /// Below this element count, threading costs more than it saves.
@@ -533,6 +533,87 @@ pub(crate) fn amax_f32(x: &Tensor, ax: usize, out_shape: &[usize]) -> Result<Ten
     }
 }
 
+/// Embedding lookup: `out[i0..i0+inner] = table[idx[i0]]`.
+///
+/// Pure random-access gather, parallel over rows.
+pub(crate) fn embedding_f32(table: &Tensor, idx: &Tensor) -> Result<Tensor> {
+    if idx.dtype() != Dtype::I64 {
+        return Err(Error::dtype("embedding", "indices must be i64"));
+    }
+    let inner = table.shape()[1];
+    let v = table.shape()[0] as i64;
+    let tv = table.as_slice_f32()?;
+    let iv = idx.storage_i64()?;
+    let shape = idx.shape();
+    let mut out = vec![0f32; idx.numel() * inner];
+    par_chunks(&mut out, |off, dst| {
+        for (j, d) in dst.chunks_mut(inner).enumerate() {
+            let class = iv[idx.storage_offset() + off / inner + j];
+            if class < 0 || class >= v {
+                d.fill(0.0);
+                continue;
+            }
+            let s = class as usize * inner;
+            d.copy_from_slice(&tv[s..s + inner]);
+        }
+    });
+    Tensor::from_vec_f32(out, &shape.iter().chain(&[inner]).cloned().collect::<Vec<_>>())
+}
+
+/// Backward of [`embedding_f32`]: scatter-add `gy` into the table rows.
+pub(crate) fn embedding_backward_f32(table: &Tensor, idx: &Tensor, gy: &Tensor) -> Result<Tensor> {
+    let v = table.shape()[0];
+    let inner = table.shape()[1];
+    let iv = idx.to_vec_i64()?;
+    let gv = gy.to_vec_f32()?;
+    let mut out = vec![0f32; v * inner];
+    // Positions per class, then one clean pass per class (parallel).
+    let mut buckets: Vec<Vec<usize>> = (0..v).map(|_| Vec::new()).collect();
+    for (p, &c) in iv.iter().enumerate() {
+        if c >= 0 && (c as usize) < v {
+            buckets[c as usize].push(p);
+        }
+    }
+    out.par_chunks_mut(inner).enumerate().for_each(|(c, row)| {
+        for &p in &buckets[c] {
+            let g = &gv[p * inner..p * inner + inner];
+            for (acc, gv_) in row.iter_mut().zip(g) {
+                *acc += gv_;
+            }
+        }
+    });
+    Tensor::from_vec_f32(out, table.shape())
+}
+
+/// Argmax over the last axis -> `i64` indices.
+pub(crate) fn argmax_last_f32(x: &Tensor) -> Result<Tensor> {
+    let rank = x.rank();
+    if rank == 0 {
+        return Err(Error::shape("argmax", "rank >= 1"));
+    }
+    let inner = x.shape()[rank - 1];
+    let owned;
+    let src = as_contig!(x, owned);
+    let out_shape: Vec<usize> = x.shape()[..rank - 1].to_vec();
+    let mut out = vec![0i64; x.numel() / inner.max(1)];
+    par_chunks(&mut out, |off, dst| {
+        for (j, d) in dst.iter_mut().enumerate() {
+            let r = off + j;
+            let s = &src[r * inner..(r + 1) * inner];
+            let mut best = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (k, &val) in s.iter().enumerate() {
+                if val > bv {
+                    bv = val;
+                    best = k;
+                }
+            }
+            *d = best as i64;
+        }
+    });
+    Tensor::from_vec_i64(out, &out_shape)
+}
+
 /// Concatenate along `ax` with contiguous block copies.
 pub(crate) fn cat_f32(tensors: &[&Tensor], ax: usize, out_shape: &[usize]) -> Result<Tensor> {
     let inner: usize = out_shape[ax + 1..].iter().product();
@@ -552,4 +633,89 @@ pub(crate) fn cat_f32(tensors: &[&Tensor], ax: usize, out_shape: &[usize]) -> Re
         cursor += tax;
     }
     Tensor::from_vec_f32(out, out_shape)
+}
+
+
+/// Masked cross-entropy: `loss = -mean(mask_i * log p_i[target_i])`.
+///
+/// Returns the scalar loss and the softmax probabilities (needed by the
+/// backward pass). `count == 0` gives loss 0 and zero gradient.
+pub(crate) fn masked_ce_f32(
+    logits: &Tensor,
+    targets: &Tensor,
+    mask: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let inner = logits.shape()[1];
+    let owned;
+    let src = as_contig!(logits, owned);
+    let tg = targets.to_vec_i64()?;
+    let mk = mask.to_vec_f32()?;
+    let n = tg.len();
+    let count: f32 = mk.iter().sum();
+    let mut probs = vec![0f32; n * inner];
+    par_rows(&mut probs, inner, |r0, blk| {
+        let mut scratch = vec![0f32; inner];
+        for (j, row) in blk.chunks_mut(inner).enumerate() {
+            let i = r0 + j;
+            let s = &src[i * inner..i * inner + inner];
+            let m = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            for (d, &v) in row.iter_mut().zip(s) {
+                *d = v - m;
+            }
+            k_exp(row, &mut scratch);
+            let sum: f32 = scratch.iter().copied().sum();
+            for (d, &v) in row.iter_mut().zip(scratch.iter()) {
+                *d = v / sum;
+            }
+        }
+    });
+    // Sequential pass for exact, reproducible loss summation.
+    let mut loss = 0f32;
+    if count > 0.0 {
+        for i in 0..n {
+            if mk[i] > 0.0 {
+                let t = tg[i];
+                if t >= 0 && (t as usize) < inner {
+                    loss -= probs[i * inner + t as usize].ln();
+                }
+            }
+        }
+        loss /= count;
+    }
+    Ok((
+        Tensor::from_vec_f32(vec![loss], &[])?,
+        Tensor::from_vec_f32(probs, logits.shape())?,
+    ))
+}
+
+/// Backward of [`masked_ce_f32`]: `dlogits_i = (p_i - onehot(t_i)) * mask_i / count`.
+pub(crate) fn masked_ce_backward_f32(
+    probs: &Tensor,
+    targets: &Tensor,
+    mask: &Tensor,
+) -> Result<Tensor> {
+    let inner = probs.shape()[1];
+    let pv = probs.to_vec_f32()?;
+    let tg = targets.to_vec_i64()?;
+    let mk = mask.to_vec_f32()?;
+    let n = tg.len();
+    let count: f32 = mk.iter().sum();
+    let mut g = vec![0f32; n * inner];
+    if count > 0.0 {
+        let inv = 1.0 / count;
+        par_rows(&mut g, inner, |r0, blk| {
+            for (j, row) in blk.chunks_mut(inner).enumerate() {
+                let i = r0 + j;
+                if mk[i] <= 0.0 {
+                    continue;
+                }
+                let s = &pv[i * inner..i * inner + inner];
+                for (k, (d, &p)) in row.iter_mut().zip(s).enumerate() {
+                    let oh = if tg[i] as usize == k { 1.0 } else { 0.0 };
+                    *d = (p - oh) * inv;
+                }
+            }
+        });
+    }
+    Tensor::from_vec_f32(g, probs.shape())
 }

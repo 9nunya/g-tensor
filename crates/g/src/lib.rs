@@ -33,7 +33,7 @@ pub use g_core::{
 };
 
 #[doc(inline)]
-pub use g_ad::{backward, detach, grad, stop_gradient, zero_grad};
+pub use g_ad::{backward, detach, gated_scan, grad, masked_ce, rms_norm, stop_gradient, zero_grad};
 #[doc(inline)]
 pub use g_nn::{
     categorical_entropy, categorical_log_prob, cross_entropy, embedding, layer_norm, linear,
@@ -306,8 +306,8 @@ pub use g_apple;
 pub mod prelude {
     pub use crate::TensorExt;
     pub use crate::{
-        add, arange_f32, backward, cat, cross_entropy, detach, from_slice_f32, gelu, grad, linear,
-        matmul, mse_loss, randn_f32, relu, sigmoid, softmax, stop_gradient, sum, tanh, zeros,
-        Device, Dtype, Reduce, Result, Tensor,
+        add, arange_f32, backward, cat, cross_entropy, detach, from_slice_f32, gated_scan, gelu,
+        grad, linear, matmul, mse_loss, randn_f32, relu, rms_norm, sigmoid, softmax,
+        stop_gradient, sum, tanh, zeros, Device, Dtype, Reduce, Result, Tensor,
     };
 }

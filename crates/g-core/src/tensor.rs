@@ -365,6 +365,49 @@ impl Tensor {
         Ok(&self.storage.i64s()?[self.offset..self.offset + self.numel()])
     }
 
+    /// Ensure this tensor uniquely owns its storage, deep-copying if it does not.
+    ///
+    /// Needed before in-place mutation: `Tensor` clones share storage by
+    /// refcount, and an autodiff graph holds clones of every parameter.
+    pub fn make_unique(&mut self) -> Result<()> {
+        if Arc::get_mut(&mut self.storage).is_some() && self.is_contiguous() && self.offset == 0 {
+            return Ok(());
+        }
+        let c = self.to_contiguous()?;
+        let data = match self.dtype {
+            Dtype::F32 => StorageData::F32(c.to_vec_f32()?),
+            Dtype::F64 => StorageData::F64(c.to_vec_f64()?),
+            Dtype::I64 => StorageData::I64(c.to_vec_i64()?),
+        };
+        self.storage = Arc::new(Storage { data });
+        self.offset = 0;
+        self.strides = row_major_strides(&self.shape);
+        Ok(())
+    }
+
+    /// Mutable zero-copy view of the underlying `f32` storage.
+    ///
+    /// Errors if the storage is shared; call [`Tensor::make_unique`] first.
+    /// In-place updates matter here: reallocating every parameter on every
+    /// optimizer step would dominate the memory budget.
+    pub fn as_mut_slice_f32(&mut self) -> Result<&mut [f32]> {
+        if self.dtype != Dtype::F32 {
+            return Err(Error::dtype("as_mut_slice", "expected f32"));
+        }
+        if !self.is_contiguous() {
+            return Err(Error::shape("as_mut_slice", "requires a contiguous tensor"));
+        }
+        let (off, n) = (self.offset, self.numel());
+        let st = Arc::get_mut(&mut self.storage).ok_or_else(|| {
+            Error::new(
+                ErrorKind::BackendPrecheck,
+                "as_mut_slice",
+                "storage is shared; call make_unique() first",
+            )
+        })?;
+        Ok(&mut st.f32s_mut()?[off..off + n])
+    }
+
     /// Offset of this view's first element within its storage. For kernels.
     pub fn storage_offset(&self) -> usize {
         self.offset
