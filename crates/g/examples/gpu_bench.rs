@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use g::Result;
 
+#[allow(dead_code)]
 fn bench(name: &str, f: impl Fn() -> Result<()>, iters: usize) {
     let _ = f();
     let t = Instant::now();

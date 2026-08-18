@@ -449,7 +449,7 @@ fn gemm_f64(m: usize, n: usize, k: usize, a: &[f64], b: &[f64]) -> Vec<f64> {
             c.as_mut_ptr(),
             n as i32,
         );
-        return c;
+        c
     }
     #[cfg(not(feature = "accelerate"))]
     {

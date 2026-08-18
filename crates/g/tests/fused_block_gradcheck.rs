@@ -4,8 +4,9 @@
 
 use g::prelude::*;
 use g::{add, fused_block, gated_scan, mul, rms_norm, sigmoid, silu};
-use g_core::{Dtype, Tensor};
+use g_core::Tensor;
 
+#[allow(clippy::too_many_arguments)]
 fn composed(
     x: &Tensor,
     wa: &Tensor,
@@ -105,7 +106,8 @@ fn fused_block_matches_composed_values_and_grads() {
         &[b, t, d],
     )
     .unwrap();
-    let mut grad_all = |fwd: &dyn Fn(
+    #[allow(clippy::type_complexity)]
+    let grad_all = |fwd: &dyn Fn(
         &Tensor,
         &Tensor,
         &Tensor,

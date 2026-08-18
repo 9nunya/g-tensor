@@ -197,29 +197,6 @@ pub fn for_each_index(shape: &[usize], mut f: impl FnMut(&[usize])) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn broadcast_zero_with_one() {
-        assert_eq!(broadcast_shapes(&[0, 3], &[1, 3]).unwrap(), vec![0, 3]);
-    }
-
-    #[test]
-    fn broadcast_incompatible() {
-        assert!(broadcast_shapes(&[2, 3], &[3, 2]).is_err());
-    }
-
-    #[test]
-    fn reshape_infer_empty() {
-        assert_eq!(
-            resolve_reshape(&[0, 3], &[0, -1], "reshape").unwrap(),
-            vec![0, 3]
-        );
-    }
-}
-
 /// Iterate row-major over `shape`, yielding the *storage offset* of each element.
 ///
 /// Unlike [`for_each_index`] this keeps a running offset (odometer) instead of
@@ -347,4 +324,27 @@ pub fn strided_copy<T: Copy + Default>(
         }
         rest = tail;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_zero_with_one() {
+        assert_eq!(broadcast_shapes(&[0, 3], &[1, 3]).unwrap(), vec![0, 3]);
+    }
+
+    #[test]
+    fn broadcast_incompatible() {
+        assert!(broadcast_shapes(&[2, 3], &[3, 2]).is_err());
+    }
+
+    #[test]
+    fn reshape_infer_empty() {
+        assert_eq!(
+            resolve_reshape(&[0, 3], &[0, -1], "reshape").unwrap(),
+            vec![0, 3]
+        );
+    }
 }

@@ -114,10 +114,10 @@ fn gated_scan_matches_explicit_recurrence() {
     for bi in 0..b {
         let mut state = vec![0f32; d];
         for ti in 0..t {
-            for j in 0..d {
+            for (j, sj) in state.iter_mut().enumerate().take(d) {
                 let o = bi * t * d + ti * d + j;
-                state[j] = av[o] * state[j] + bv[o];
-                assert!((h[o] - state[j]).abs() < 1e-6, "mismatch at {o}");
+                *sj = av[o] * *sj + bv[o];
+                assert!((h[o] - *sj).abs() < 1e-6, "mismatch at {o}");
             }
         }
     }

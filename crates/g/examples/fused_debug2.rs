@@ -67,7 +67,7 @@ fn main() {
     let f1 = xn2.linear(&wf10, None).unwrap();
     let sf1 = silu(&f1).unwrap();
     let f2 = sf1.linear(&wf20, None).unwrap();
-    let y = add(&out1, &mul(&f2, &g40).unwrap()).unwrap();
+    let _y = add(&out1, &mul(&f2, &g40).unwrap()).unwrap();
 
     // tail function from a given intermediate to the loss, treating the
     // intermediate as a requires_grad leaf.

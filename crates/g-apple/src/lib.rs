@@ -89,7 +89,7 @@ fn states() -> &'static [Arc<GpuState>] {
             .collect();
         // Highest score first. This makes the single-device path use the dGPU
         // on a dual-GPU Intel MacBook.
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|b| std::cmp::Reverse(b.0));
         scored
             .into_iter()
             .map(|(_, i, name)| {

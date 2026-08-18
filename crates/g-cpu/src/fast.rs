@@ -78,7 +78,7 @@ pub(crate) fn k_gelu(src: &[f32], dst: &mut [f32]) {
     for (d, &s) in dst.iter_mut().zip(src) {
         *d = C * (s + 0.044715 * s * s * s);
     }
-    let tmp = dst.as_ptr() as *const f32;
+    let tmp = dst.as_ptr();
     k_tanh(unsafe { std::slice::from_raw_parts(tmp, dst.len()) }, dst);
     for (d, &s) in dst.iter_mut().zip(src) {
         *d = 0.5 * s * (1.0 + *d);
@@ -90,7 +90,7 @@ pub(crate) fn k_sigmoid(src: &[f32], dst: &mut [f32]) {
     for (d, &s) in dst.iter_mut().zip(src) {
         *d = -s;
     }
-    let tmp = dst.as_ptr() as *const f32;
+    let tmp = dst.as_ptr();
     k_exp(unsafe { std::slice::from_raw_parts(tmp, dst.len()) }, dst);
     for d in dst.iter_mut() {
         *d = 1.0 / (1.0 + *d);
@@ -286,8 +286,8 @@ pub(crate) fn sum_f32(x: &Tensor, reduced: &[bool], out_shape: &[usize]) -> Resu
     {
         // Row-major strides of the *reduced* output, mapped back onto input dims.
         let mut kept: Vec<usize> = Vec::new();
-        for k in 0..rank {
-            if !reduced[k] {
+        for (k, is_reduced) in reduced.iter().enumerate().take(rank) {
+            if !is_reduced {
                 kept.push(k);
             }
         }

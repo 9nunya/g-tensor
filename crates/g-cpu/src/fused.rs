@@ -141,6 +141,7 @@ fn silu_local(x: &Tensor, out: &mut [f32]) {
 
 /// Backward. Returns grads in order (x, wa, wb, wo, wf1, wf2, g1, g2, g3, g4).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub fn fused_block_bwd(
     aux: &FusedAux,
     wa: &Tensor,

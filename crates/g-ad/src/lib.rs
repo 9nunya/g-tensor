@@ -1511,201 +1511,6 @@ pub fn reshape(x: &Tensor, shape: &[isize]) -> Result<Tensor> {
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mul_grad() {
-        let a = Tensor::from_slice_f32(&[2.0, 3.0], &[2])
-            .unwrap()
-            .with_requires_grad();
-        let b = Tensor::from_slice_f32(&[4.0, 5.0], &[2])
-            .unwrap()
-            .with_requires_grad();
-        let y = sum(&mul(&a, &b).unwrap(), None, false).unwrap();
-        let gs = grad(&y, &[&a, &b]).unwrap();
-        assert_eq!(gs[0].to_vec_f32().unwrap(), vec![4.0, 5.0]);
-        assert_eq!(gs[1].to_vec_f32().unwrap(), vec![2.0, 3.0]);
-    }
-
-    #[test]
-    fn relu_zero_subgradient() {
-        let x = Tensor::from_slice_f32(&[-1.0, 0.0, 2.0], &[3])
-            .unwrap()
-            .with_requires_grad();
-        let y = sum(&relu(&x).unwrap(), None, false).unwrap();
-        let g = grad(&y, &[&x]).unwrap();
-        assert_eq!(g[0].to_vec_f32().unwrap(), vec![0.0, 0.0, 1.0]);
-    }
-
-    #[test]
-    fn diamond_runs_each_vjp_once() {
-        // y = (x + x) * (x + x) = 4x^2  ->  dy/dx = 8x = 16 at x = 2.
-        // A tree walk double-counts the shared `x + x` node.
-        let x = Tensor::from_slice_f32(&[2.0], &[])
-            .unwrap()
-            .with_requires_grad();
-        let s = add(&x, &x).unwrap();
-        let y = mul(&s, &s).unwrap();
-        let g = grad(&y, &[&x]).unwrap();
-        assert!((g[0].item_f32().unwrap() - 16.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn grad_is_fresh_across_rebuilt_graphs() {
-        let x = Tensor::from_slice_f32(&[3.0], &[])
-            .unwrap()
-            .with_requires_grad();
-
-        let y0 = mul(&x, &x).unwrap();
-        let g0 = grad(&y0, &[&x]).unwrap();
-        let y1 = mul(&x, &x).unwrap();
-        let g1 = grad(&y1, &[&x]).unwrap();
-
-        assert_eq!(g0[0].item_f32().unwrap(), 6.0);
-        assert_eq!(g1[0].item_f32().unwrap(), 6.0);
-    }
-
-    #[test]
-    fn backward_accumulates_until_zeroed() {
-        let x = Tensor::from_slice_f32(&[2.0], &[])
-            .unwrap()
-            .with_requires_grad();
-
-        let first = backward(&mul(&x, &x).unwrap()).unwrap();
-        assert_eq!(first[0].1.item_f32().unwrap(), 4.0);
-        let second = backward(&mul(&x, &x).unwrap()).unwrap();
-        assert_eq!(second[0].1.item_f32().unwrap(), 8.0);
-
-        zero_grad(&[&x]);
-        let after_zero = backward(&mul(&x, &x).unwrap()).unwrap();
-        assert_eq!(after_zero[0].1.item_f32().unwrap(), 4.0);
-    }
-
-    #[test]
-    fn grad_clears_every_reachable_leaf_and_sums_shared_dag() {
-        let x = Tensor::from_slice_f32(&[2.0], &[])
-            .unwrap()
-            .with_requires_grad();
-        let y = Tensor::from_slice_f32(&[3.0], &[])
-            .unwrap()
-            .with_requires_grad();
-        let unrequested = Tensor::from_slice_f32(&[5.0], &[])
-            .unwrap()
-            .with_requires_grad();
-
-        // Poison an unrequested leaf with an explicitly accumulated gradient.
-        backward(&mul(&unrequested, &unrequested).unwrap()).unwrap();
-        assert_eq!(
-            unrequested
-                .leaf()
-                .unwrap()
-                .grad
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .item_f32()
-                .unwrap(),
-            10.0
-        );
-
-        // The shared node must still sum both paths within this one DAG.
-        let shared = add(&x, &y).unwrap();
-        let output = add(&mul(&shared, &shared).unwrap(), &unrequested).unwrap();
-        let gs = grad(&output, &[&x, &y]).unwrap();
-        assert_eq!(gs[0].item_f32().unwrap(), 10.0);
-        assert_eq!(gs[1].item_f32().unwrap(), 10.0);
-
-        // Although it was not requested, this reachable leaf was touched by
-        // reverse mode and therefore must contain only this call's gradient.
-        assert_eq!(
-            unrequested
-                .leaf()
-                .unwrap()
-                .grad
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .item_f32()
-                .unwrap(),
-            1.0
-        );
-    }
-
-    #[test]
-    fn grad_returns_zero_for_a_stale_disconnected_input() {
-        let connected = Tensor::from_slice_f32(&[2.0], &[])
-            .unwrap()
-            .with_requires_grad();
-        let disconnected = Tensor::from_slice_f32(&[4.0], &[])
-            .unwrap()
-            .with_requires_grad();
-
-        backward(&mul(&disconnected, &disconnected).unwrap()).unwrap();
-        let output = mul(&connected, &connected).unwrap();
-        let gs = grad(&output, &[&connected, &disconnected]).unwrap();
-
-        assert_eq!(gs[0].item_f32().unwrap(), 4.0);
-        assert_eq!(gs[1].item_f32().unwrap(), 0.0);
-        assert!(disconnected.leaf().unwrap().grad.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn fresh_grad_has_positive_convex_same_batch_secant() {
-        let mut p = Tensor::from_slice_f32(&[1.0, -2.0, 0.5], &[3])
-            .unwrap()
-            .with_requires_grad();
-
-        let g0 = {
-            let square = mul(&p, &p).unwrap();
-            let loss = mul_scalar(&sum(&square, None, false).unwrap(), 0.5).unwrap();
-            grad(&loss, &[&p]).unwrap().remove(0)
-        };
-        let p0 = p.to_vec_f32().unwrap();
-        let g0v = g0.to_vec_f32().unwrap();
-
-        // Keep the same leaf/gradient slot while stepping the persistent
-        // parameter along -g0, just as a same-batch secant probe does.
-        let step_size = 0.1_f32;
-        p.make_unique().unwrap();
-        for (value, &g) in p.as_mut_slice_f32().unwrap().iter_mut().zip(&g0v) {
-            *value -= step_size * g;
-        }
-        let p1 = p.to_vec_f32().unwrap();
-
-        let g1 = {
-            let square = mul(&p, &p).unwrap();
-            let loss = mul_scalar(&sum(&square, None, false).unwrap(), 0.5).unwrap();
-            grad(&loss, &[&p]).unwrap().remove(0)
-        };
-        let g1v = g1.to_vec_f32().unwrap();
-
-        let secant: f32 = p1
-            .iter()
-            .zip(&p0)
-            .zip(g1v.iter().zip(&g0v))
-            .map(|((&new_p, &old_p), (&new_g, &old_g))| (new_p - old_p) * (new_g - old_g))
-            .sum();
-        // Historical accumulation made g1 = grad(p0) + grad(p1), producing
-        // -0.4725 here instead of the fresh quadratic secant +0.0525.
-        assert!(secant > 0.0, "convex same-batch secant was {secant}");
-        assert!((secant - 0.0525).abs() < 1e-5);
-    }
-
-    #[test]
-    fn stop_gradient_zeros() {
-        let x = Tensor::from_slice_f32(&[3.0], &[])
-            .unwrap()
-            .with_requires_grad();
-        let y = stop_gradient(&x).unwrap();
-        let g = grad(&y, &[&x]).unwrap();
-        assert_eq!(g[0].item_f32().unwrap(), 0.0);
-    }
-}
-
 struct ScanBw {
     parents: Vec<Tensor>,
     a: Tensor,
@@ -1927,4 +1732,199 @@ pub fn fused_block(
         eps,
     }));
     Ok(y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mul_grad() {
+        let a = Tensor::from_slice_f32(&[2.0, 3.0], &[2])
+            .unwrap()
+            .with_requires_grad();
+        let b = Tensor::from_slice_f32(&[4.0, 5.0], &[2])
+            .unwrap()
+            .with_requires_grad();
+        let y = sum(&mul(&a, &b).unwrap(), None, false).unwrap();
+        let gs = grad(&y, &[&a, &b]).unwrap();
+        assert_eq!(gs[0].to_vec_f32().unwrap(), vec![4.0, 5.0]);
+        assert_eq!(gs[1].to_vec_f32().unwrap(), vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn relu_zero_subgradient() {
+        let x = Tensor::from_slice_f32(&[-1.0, 0.0, 2.0], &[3])
+            .unwrap()
+            .with_requires_grad();
+        let y = sum(&relu(&x).unwrap(), None, false).unwrap();
+        let g = grad(&y, &[&x]).unwrap();
+        assert_eq!(g[0].to_vec_f32().unwrap(), vec![0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn diamond_runs_each_vjp_once() {
+        // y = (x + x) * (x + x) = 4x^2  ->  dy/dx = 8x = 16 at x = 2.
+        // A tree walk double-counts the shared `x + x` node.
+        let x = Tensor::from_slice_f32(&[2.0], &[])
+            .unwrap()
+            .with_requires_grad();
+        let s = add(&x, &x).unwrap();
+        let y = mul(&s, &s).unwrap();
+        let g = grad(&y, &[&x]).unwrap();
+        assert!((g[0].item_f32().unwrap() - 16.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn grad_is_fresh_across_rebuilt_graphs() {
+        let x = Tensor::from_slice_f32(&[3.0], &[])
+            .unwrap()
+            .with_requires_grad();
+
+        let y0 = mul(&x, &x).unwrap();
+        let g0 = grad(&y0, &[&x]).unwrap();
+        let y1 = mul(&x, &x).unwrap();
+        let g1 = grad(&y1, &[&x]).unwrap();
+
+        assert_eq!(g0[0].item_f32().unwrap(), 6.0);
+        assert_eq!(g1[0].item_f32().unwrap(), 6.0);
+    }
+
+    #[test]
+    fn backward_accumulates_until_zeroed() {
+        let x = Tensor::from_slice_f32(&[2.0], &[])
+            .unwrap()
+            .with_requires_grad();
+
+        let first = backward(&mul(&x, &x).unwrap()).unwrap();
+        assert_eq!(first[0].1.item_f32().unwrap(), 4.0);
+        let second = backward(&mul(&x, &x).unwrap()).unwrap();
+        assert_eq!(second[0].1.item_f32().unwrap(), 8.0);
+
+        zero_grad(&[&x]);
+        let after_zero = backward(&mul(&x, &x).unwrap()).unwrap();
+        assert_eq!(after_zero[0].1.item_f32().unwrap(), 4.0);
+    }
+
+    #[test]
+    fn grad_clears_every_reachable_leaf_and_sums_shared_dag() {
+        let x = Tensor::from_slice_f32(&[2.0], &[])
+            .unwrap()
+            .with_requires_grad();
+        let y = Tensor::from_slice_f32(&[3.0], &[])
+            .unwrap()
+            .with_requires_grad();
+        let unrequested = Tensor::from_slice_f32(&[5.0], &[])
+            .unwrap()
+            .with_requires_grad();
+
+        // Poison an unrequested leaf with an explicitly accumulated gradient.
+        backward(&mul(&unrequested, &unrequested).unwrap()).unwrap();
+        assert_eq!(
+            unrequested
+                .leaf()
+                .unwrap()
+                .grad
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .item_f32()
+                .unwrap(),
+            10.0
+        );
+
+        // The shared node must still sum both paths within this one DAG.
+        let shared = add(&x, &y).unwrap();
+        let output = add(&mul(&shared, &shared).unwrap(), &unrequested).unwrap();
+        let gs = grad(&output, &[&x, &y]).unwrap();
+        assert_eq!(gs[0].item_f32().unwrap(), 10.0);
+        assert_eq!(gs[1].item_f32().unwrap(), 10.0);
+
+        // Although it was not requested, this reachable leaf was touched by
+        // reverse mode and therefore must contain only this call's gradient.
+        assert_eq!(
+            unrequested
+                .leaf()
+                .unwrap()
+                .grad
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .item_f32()
+                .unwrap(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn grad_returns_zero_for_a_stale_disconnected_input() {
+        let connected = Tensor::from_slice_f32(&[2.0], &[])
+            .unwrap()
+            .with_requires_grad();
+        let disconnected = Tensor::from_slice_f32(&[4.0], &[])
+            .unwrap()
+            .with_requires_grad();
+
+        backward(&mul(&disconnected, &disconnected).unwrap()).unwrap();
+        let output = mul(&connected, &connected).unwrap();
+        let gs = grad(&output, &[&connected, &disconnected]).unwrap();
+
+        assert_eq!(gs[0].item_f32().unwrap(), 4.0);
+        assert_eq!(gs[1].item_f32().unwrap(), 0.0);
+        assert!(disconnected.leaf().unwrap().grad.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn fresh_grad_has_positive_convex_same_batch_secant() {
+        let mut p = Tensor::from_slice_f32(&[1.0, -2.0, 0.5], &[3])
+            .unwrap()
+            .with_requires_grad();
+
+        let g0 = {
+            let square = mul(&p, &p).unwrap();
+            let loss = mul_scalar(&sum(&square, None, false).unwrap(), 0.5).unwrap();
+            grad(&loss, &[&p]).unwrap().remove(0)
+        };
+        let p0 = p.to_vec_f32().unwrap();
+        let g0v = g0.to_vec_f32().unwrap();
+
+        // Keep the same leaf/gradient slot while stepping the persistent
+        // parameter along -g0, just as a same-batch secant probe does.
+        let step_size = 0.1_f32;
+        p.make_unique().unwrap();
+        for (value, &g) in p.as_mut_slice_f32().unwrap().iter_mut().zip(&g0v) {
+            *value -= step_size * g;
+        }
+        let p1 = p.to_vec_f32().unwrap();
+
+        let g1 = {
+            let square = mul(&p, &p).unwrap();
+            let loss = mul_scalar(&sum(&square, None, false).unwrap(), 0.5).unwrap();
+            grad(&loss, &[&p]).unwrap().remove(0)
+        };
+        let g1v = g1.to_vec_f32().unwrap();
+
+        let secant: f32 = p1
+            .iter()
+            .zip(&p0)
+            .zip(g1v.iter().zip(&g0v))
+            .map(|((&new_p, &old_p), (&new_g, &old_g))| (new_p - old_p) * (new_g - old_g))
+            .sum();
+        // Historical accumulation made g1 = grad(p0) + grad(p1), producing
+        // -0.4725 here instead of the fresh quadratic secant +0.0525.
+        assert!(secant > 0.0, "convex same-batch secant was {secant}");
+        assert!((secant - 0.0525).abs() < 1e-5);
+    }
+
+    #[test]
+    fn stop_gradient_zeros() {
+        let x = Tensor::from_slice_f32(&[3.0], &[])
+            .unwrap()
+            .with_requires_grad();
+        let y = stop_gradient(&x).unwrap();
+        let g = grad(&y, &[&x]).unwrap();
+        assert_eq!(g[0].item_f32().unwrap(), 0.0);
+    }
 }
