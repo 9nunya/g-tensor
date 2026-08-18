@@ -54,6 +54,7 @@ dependencies = [
 name = "g-ad"
 version = "0.1.0"
 dependencies = [
+ "g-apple",
  "g-core",
  "g-cpu",
 ]

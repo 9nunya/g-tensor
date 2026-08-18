@@ -1,11 +1,12 @@
 # g
 
-A Rust tensor and ML library for **Apple Silicon**, designed to feel as easy as
-PyTorch without copying its API.
+A Rust tensor and ML library for **Apple Silicon** and Intel Macs with Metal,
+designed to feel as easy as PyTorch without copying its API.
 
 v1 is **CPU-first**. On an M3 Air, representative PC/training MLP forwards are
 faster on the CPU than on naive Metal. Large GEMMs can use MPSGraph when you
-build with `--features gpu`.
+build with `--features gpu`; on a multi-GPU machine the backend splits one
+large GEMM across every Metal device **and** the CPU in parallel.
 
 ```rust
 use g::prelude::*;
@@ -31,11 +32,12 @@ fn main() -> Result<()> {
 - Linear algebra: `matmul`, `linear`
 - Indexing: `gather`, `scatter_add`, `cat`/`stack`
 - NN: softmax, log_softmax, mse, nll, cross-entropy, layer_norm, embedding
-- AD: `grad(&loss, &[&w])`, `.backward()` on scalars, `stop_gradient` / `detach`
+- AD: fresh functional `grad(&loss, &[&w])`, accumulating `.backward()` on scalars, `stop_gradient` / `detach`
 - Optim: SGD, AdamW
 - Local predictive coding without reversing through inference (`stop_gradient`)
 - Optional Accelerate GEMM (`cpu-accelerate`)
-- Optional MPSGraph GEMM for large FP32 mats (`gpu`)
+- Optional MPSGraph GEMM for large FP32 mats (`gpu`): single device, all Metal
+  devices in parallel, or all devices plus the CPU
 
 ## Non-goals
 
@@ -67,6 +69,12 @@ MSRV: current stable. License: MIT OR Apache-2.0.
 CPU is the default because that is what is fast on the M3 Air at PC/train
 shapes. Do not call `.to(Gpu)` to “go faster” on small layers. Performance
 regression gates are not enabled yet.
+
+On a dual-GPU Intel MacBook the GPU backend uses the AMD dGPU plus the CPU in
+parallel by default, and leaves the Intel iGPU out (it shares memory bandwidth
+with the CPU and adds little once the CPU is busy). Call
+`g::set_include_integrated(true)` to opt the iGPU back in; `gpu_device_names()`
+reports the devices actually used for GEMMs.
 
 
 ## Examples

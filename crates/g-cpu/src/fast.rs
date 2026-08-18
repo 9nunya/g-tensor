@@ -255,7 +255,9 @@ pub(crate) fn sum_f32(x: &Tensor, reduced: &[bool], out_shape: &[usize]) -> Resu
                 if n < PAR_MIN {
                     s.iter().copied().sum::<f32>()
                 } else {
-                    s.par_chunks(1 << 14).map(|c| c.iter().copied().sum::<f32>()).sum()
+                    s.par_chunks(1 << 14)
+                        .map(|c| c.iter().copied().sum::<f32>())
+                        .sum()
                 }
             }
             Err(_) => x.to_vec_f32()?.iter().copied().sum::<f32>(),
@@ -326,7 +328,6 @@ pub(crate) fn sum_f32(x: &Tensor, reduced: &[bool], out_shape: &[usize]) -> Resu
     Tensor::from_vec_f32(acc, out_shape)
 }
 
-
 /// Fused GELU forward + local derivative in a single pass.
 ///
 /// Training needs both `y` and `dy/dx`; computing them separately costs two
@@ -383,7 +384,6 @@ pub(crate) fn gelu_fwd_bwd(x: &Tensor) -> Result<(Tensor, Tensor)> {
         Tensor::from_vec_f32(d, x.shape())?,
     ))
 }
-
 
 /// Split `out` into row blocks and process them in parallel.
 /// `f(first_row_index, block)` sees whole rows of length `inner`.
@@ -558,7 +558,10 @@ pub(crate) fn embedding_f32(table: &Tensor, idx: &Tensor) -> Result<Tensor> {
             d.copy_from_slice(&tv[s..s + inner]);
         }
     });
-    Tensor::from_vec_f32(out, &shape.iter().chain(&[inner]).cloned().collect::<Vec<_>>())
+    Tensor::from_vec_f32(
+        out,
+        &shape.iter().chain(&[inner]).cloned().collect::<Vec<_>>(),
+    )
 }
 
 /// Backward of [`embedding_f32`]: scatter-add `gy` into the table rows.
@@ -636,7 +639,6 @@ pub(crate) fn cat_f32(tensors: &[&Tensor], ax: usize, out_shape: &[usize]) -> Re
     Tensor::from_vec_f32(out, out_shape)
 }
 
-
 /// Masked cross-entropy: `loss = -mean(mask_i * log p_i[target_i])`.
 ///
 /// Returns the scalar loss and the softmax probabilities (needed by the
@@ -655,7 +657,10 @@ pub(crate) fn masked_ce_f32(
     if n * inner != logits.numel() || mk.len() != n {
         return Err(Error::shape(
             "masked_ce",
-            format!("targets/mask length {n} inconsistent with logits {}x{inner}", logits.shape()[0]),
+            format!(
+                "targets/mask length {n} inconsistent with logits {}x{inner}",
+                logits.shape()[0]
+            ),
         ));
     }
     // |mask| normalization: RL passes advantage weights (possibly negative)
@@ -678,14 +683,20 @@ pub(crate) fn masked_ce_f32(
             }
         }
     });
-    // Sequential pass for exact, reproducible loss summation.
+    // Sequential pass for exact, reproducible loss summation. Masks are
+    // signed weights: ordinary supervised rows use 0/1, while policy-gradient
+    // callers may use negative advantages. Normalize by |weight| so opposite
+    // signs do not create an unstable near-zero denominator.
     let mut loss = 0f32;
     if count > 0.0 {
         for i in 0..n {
-            if mk[i] > 0.0 {
+            if mk[i] != 0.0 {
                 let t = tg[i];
                 if t >= 0 && (t as usize) < inner {
-                    loss -= probs[i * inner + t as usize].ln();
+                    // Clamp against softmax underflow: ln(0) = -inf would
+                    // poison the loss and, through it, the gradients.
+                    let p = probs[i * inner + t as usize].clamp(1e-30, 1.0);
+                    loss -= mk[i] * p.ln();
                 }
             }
         }
@@ -711,7 +722,10 @@ pub(crate) fn masked_ce_backward_f32(
     if n * inner != probs.numel() || mk.len() != n {
         return Err(Error::shape(
             "masked_ce_backward",
-            format!("targets/mask length {n} inconsistent with probs {}x{inner}", probs.shape()[0]),
+            format!(
+                "targets/mask length {n} inconsistent with probs {}x{inner}",
+                probs.shape()[0]
+            ),
         ));
     }
     let count: f32 = mk.iter().map(|m| m.abs()).sum();
@@ -721,20 +735,19 @@ pub(crate) fn masked_ce_backward_f32(
         par_rows(&mut g, inner, |r0, blk| {
             for (j, row) in blk.chunks_mut(inner).enumerate() {
                 let i = r0 + j;
-                if mk[i] <= 0.0 {
+                if mk[i] == 0.0 {
                     continue;
                 }
                 let s = &pv[i * inner..i * inner + inner];
                 for (k, (d, &p)) in row.iter_mut().zip(s).enumerate() {
                     let oh = if tg[i] as usize == k { 1.0 } else { 0.0 };
-                    *d = (p - oh) * inv;
+                    *d = (p - oh) * mk[i] * inv;
                 }
             }
         });
     }
     Tensor::from_vec_f32(g, probs.shape())
 }
-
 
 /// Sigmoid value and local derivative in one pass (training pays one pass
 /// instead of the fwd + a two-pass local + a backward mul).
@@ -758,7 +771,7 @@ pub(crate) fn sigmoid_fwd_bwd(x: &Tensor) -> Result<(Tensor, Tensor)> {
         }
         let p = dc.as_ptr();
         k_exp(unsafe { std::slice::from_raw_parts(p, dc.len()) }, dc);
-        for (i, &s) in src.iter().enumerate() {
+        for i in 0..src.len() {
             let v = 1.0 / (1.0 + dc[i]);
             yc[i] = v;
             dc[i] = v * (1.0 - v);

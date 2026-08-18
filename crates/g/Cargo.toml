@@ -14,7 +14,7 @@ categories = ["science", "mathematics"]
 default = ["cpu"]
 cpu = []
 cpu-accelerate = ["g-cpu/accelerate"]
-gpu = ["dep:g-apple"]
+gpu = ["dep:g-apple", "g-ad/gpu"]
 
 [dependencies]
 g-core.workspace = true

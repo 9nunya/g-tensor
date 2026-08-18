@@ -1,4 +1,19 @@
 //! CPU kernels (oracle). Optional Accelerate GEMM via feature `accelerate`.
+//!
+//! This crate implements every `g` primitive on the CPU. It is the reference
+//! backend: fast parallel kernels over [`g_core::Tensor`] views, plus fused
+//! ops (embedding, softmax, cross-entropy, linear recurrence, normalization)
+//! that keep training memory and autodiff graph size low.
+//!
+//! Enable the `accelerate` feature to link Apple's Accelerate framework, which
+//! upgrades GEMM to BLAS and transcendentals to vForce. Without it the same
+//! functions run in portable Rust fallbacks.
+//!
+//! # Parallelism
+//!
+//! Kernels use [rayon] and split work above an element-count threshold. The
+//! thread pool size comes from the process's global rayon configuration; see
+//! [`thread_count`] for the value kernels observe.
 
 use g_core::{
     broadcast_shapes, for_each_index, normalize_axis, numel, Dtype, Error, ErrorKind, Result,
@@ -6,10 +21,12 @@ use g_core::{
 };
 
 mod fast;
+mod fused;
 mod scan;
 mod shape_ops;
 mod unary;
 
+pub use fused::{fused_block_bwd, fused_block_fwd, FusedAux};
 pub use scan::{gated_scan, gated_scan_backward, rms_norm, rms_norm_backward};
 pub use shape_ops::{amax, cat, stack};
 pub use unary::{
@@ -123,6 +140,7 @@ where
     }
 }
 
+/// Elementwise `a + b` with broadcasting.
 pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if a.dtype() == Dtype::F32 && b.dtype() == Dtype::F32 {
         return fast::binary_f32("add", a, b, |x, y| x + y);
@@ -130,6 +148,7 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     binary_float("add", a, b, |x, y| x + y, |x, y| x + y)
 }
 
+/// Elementwise `a - b` with broadcasting.
 pub fn sub(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if a.dtype() == Dtype::F32 && b.dtype() == Dtype::F32 {
         return fast::binary_f32("sub", a, b, |x, y| x - y);
@@ -137,6 +156,7 @@ pub fn sub(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     binary_float("sub", a, b, |x, y| x - y, |x, y| x - y)
 }
 
+/// Elementwise `a * b` with broadcasting.
 pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if a.dtype() == Dtype::F32 && b.dtype() == Dtype::F32 {
         return fast::binary_f32("mul", a, b, |x, y| x * y);
@@ -144,6 +164,7 @@ pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     binary_float("mul", a, b, |x, y| x * y, |x, y| x * y)
 }
 
+/// Elementwise multiply by a scalar `s`.
 pub fn mul_scalar(a: &Tensor, s: f64) -> Result<Tensor> {
     match a.dtype() {
         Dtype::F32 => {
@@ -158,10 +179,12 @@ pub fn mul_scalar(a: &Tensor, s: f64) -> Result<Tensor> {
     }
 }
 
+/// Elementwise negation `-a`.
 pub fn neg(a: &Tensor) -> Result<Tensor> {
     mul_scalar(a, -1.0)
 }
 
+/// Elementwise ReLU `max(a, 0)`.
 pub fn relu(a: &Tensor) -> Result<Tensor> {
     match a.dtype() {
         Dtype::F32 => fast::map_f32(a, |x| x.max(0.0)),
@@ -173,6 +196,7 @@ pub fn relu(a: &Tensor) -> Result<Tensor> {
     }
 }
 
+/// Elementwise hyperbolic tangent.
 pub fn tanh(a: &Tensor) -> Result<Tensor> {
     match a.dtype() {
         Dtype::F32 => fast::unary_f32(a, fast::k_tanh),
@@ -184,6 +208,7 @@ pub fn tanh(a: &Tensor) -> Result<Tensor> {
     }
 }
 
+/// Elementwise square `a * a`.
 pub fn square(a: &Tensor) -> Result<Tensor> {
     mul(a, a)
 }
@@ -193,7 +218,8 @@ pub fn embedding(table: &Tensor, idx: &Tensor) -> Result<Tensor> {
     fast::embedding_f32(table, idx)
 }
 
-/// Masked cross-entropy: `-mean(mask * log p[target])`. Returns `(loss, probs)`.
+/// Weighted cross-entropy: `-sum(mask * log p[target]) / sum(abs(mask))`.
+/// Signed weights are supported (for example, policy-gradient advantages).
 pub fn masked_ce(logits: &Tensor, targets: &Tensor, mask: &Tensor) -> Result<(Tensor, Tensor)> {
     fast::masked_ce_f32(logits, targets, mask)
 }
@@ -273,6 +299,9 @@ fn reduce_axes(shape: &[usize], axes: &[usize], keepdims: bool) -> Result<Vec<us
     Ok(out)
 }
 
+/// Reduce `x` by summation over `axes` (`None` = all axes).
+///
+/// With `keepdims` the reduced axes are retained as size 1 instead of dropped.
 pub fn sum(x: &Tensor, axes: Option<&[isize]>, keepdims: bool) -> Result<Tensor> {
     if !x.dtype().is_float() {
         return Err(Error::dtype("sum", "v1 sum is float-only"));
@@ -329,6 +358,7 @@ pub fn sum(x: &Tensor, axes: Option<&[isize]>, keepdims: bool) -> Result<Tensor>
     }
 }
 
+/// Reduce `x` by arithmetic mean over `axes` (`None` = all axes).
 pub fn mean(x: &Tensor, axes: Option<&[isize]>, keepdims: bool) -> Result<Tensor> {
     if !x.dtype().is_float() {
         return Err(Error::dtype("mean", "float only"));
@@ -435,7 +465,6 @@ fn gemm_f64(m: usize, n: usize, k: usize, a: &[f64], b: &[f64]) -> Vec<f64> {
     }
 }
 
-
 /// Rank-2 `f32` GEMM that consumes transposed *views* directly.
 ///
 /// Matmul backward computes `aᵀ @ gy` and `gy @ bᵀ`. Materializing those
@@ -478,8 +507,16 @@ fn matmul2d_blas(a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
     unsafe {
         accelerate::cblas_sgemm(
             accelerate::ROW,
-            if ta { accelerate::TRANS } else { accelerate::NOTRANS },
-            if tb { accelerate::TRANS } else { accelerate::NOTRANS },
+            if ta {
+                accelerate::TRANS
+            } else {
+                accelerate::NOTRANS
+            },
+            if tb {
+                accelerate::TRANS
+            } else {
+                accelerate::NOTRANS
+            },
             m as i32,
             n as i32,
             k as i32,
@@ -506,7 +543,11 @@ fn matmul3d_blas(a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
     fn layout(t: &Tensor) -> Option<(bool, usize, usize)> {
         let (sh, st) = (t.shape(), t.strides());
         let (m, k) = (sh[sh.len() - 2], sh[sh.len() - 1]);
-        let bstride = if sh.len() >= 3 { st[sh.len() - 3] as usize } else { 0 };
+        let bstride = if sh.len() >= 3 {
+            st[sh.len() - 3] as usize
+        } else {
+            0
+        };
         if st[sh.len() - 1] == 1 && st[sh.len() - 2] == k as isize {
             Some((false, k.max(1), bstride)) // row-major
         } else if st[sh.len() - 2] == 1 && st[sh.len() - 1] == m as isize {
@@ -547,8 +588,16 @@ fn matmul3d_blas(a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
         unsafe {
             accelerate::cblas_sgemm(
                 accelerate::ROW,
-                if ta { accelerate::TRANS } else { accelerate::NOTRANS },
-                if tb { accelerate::TRANS } else { accelerate::NOTRANS },
+                if ta {
+                    accelerate::TRANS
+                } else {
+                    accelerate::NOTRANS
+                },
+                if tb {
+                    accelerate::TRANS
+                } else {
+                    accelerate::NOTRANS
+                },
                 bm as i32,
                 n as i32,
                 bk as i32,
@@ -721,6 +770,9 @@ fn squeeze_matmul(out: &mut Tensor, left: bool, right: bool) {
     }
 }
 
+/// Gather slices of `x` along `axis` at `i64` indices `index`.
+///
+/// The output has `index`'s shape and the input's element type.
 pub fn gather(x: &Tensor, axis: isize, index: &Tensor) -> Result<Tensor> {
     if index.dtype() != Dtype::I64 {
         return Err(Error::dtype("gather", "index must be i64"));
@@ -820,6 +872,9 @@ pub fn gather(x: &Tensor, axis: isize, index: &Tensor) -> Result<Tensor> {
     }
 }
 
+/// Scatter-add `src` into a copy of `dst` along `axis` at `i64` indices.
+///
+/// `index` and `src` must have identical shapes. Out-of-bounds indices error.
 pub fn scatter_add(dst: &Tensor, axis: isize, index: &Tensor, src: &Tensor) -> Result<Tensor> {
     if index.dtype() != Dtype::I64 {
         return Err(Error::dtype("scatter_add", "index must be i64"));
@@ -908,6 +963,7 @@ pub fn scatter_add(dst: &Tensor, axis: isize, index: &Tensor, src: &Tensor) -> R
     }
 }
 
+/// In-place ReLU on a unique, untracked tensor.
 pub fn relu_inplace(x: &mut Tensor) -> Result<()> {
     x.require_unique("relu_inplace")?;
     // Unique storage: rebuild via copy of values into same tensor is hard without mut storage.

@@ -33,8 +33,12 @@ fn gated_scan_gradients_match_finite_differences() {
     let (b, t, d) = (2usize, 5usize, 3usize);
     let n = b * t * d;
     // Gates in (0,1) via sigmoid of a raw tensor, inputs arbitrary.
-    let araw: Vec<f32> = (0..n).map(|i| ((i * 37 % 23) as f32 / 23.0) - 0.5).collect();
-    let bs: Vec<f32> = (0..n).map(|i| ((i * 17 % 19) as f32 / 19.0) - 0.5).collect();
+    let araw: Vec<f32> = (0..n)
+        .map(|i| ((i * 37 % 23) as f32 / 23.0) - 0.5)
+        .collect();
+    let bs: Vec<f32> = (0..n)
+        .map(|i| ((i * 17 % 19) as f32 / 19.0) - 0.5)
+        .collect();
     let a0 = Tensor::from_vec_f32(araw.clone(), &[b, t, d]).unwrap();
     let b0 = Tensor::from_vec_f32(bs.clone(), &[b, t, d]).unwrap();
     // weights make the scalar objective non-trivial
@@ -44,7 +48,12 @@ fn gated_scan_gradients_match_finite_differences() {
     let obj = |a: &Tensor, bb: &Tensor| -> f32 {
         let g = g::sigmoid(a).unwrap();
         let h = gated_scan(&g, bb).unwrap();
-        g::mul(&h, &wt).unwrap().sum(None, false).unwrap().to_vec_f32().unwrap()[0]
+        g::mul(&h, &wt)
+            .unwrap()
+            .sum(None, false)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap()[0]
     };
 
     let ag = a0.clone().with_requires_grad();
@@ -66,13 +75,22 @@ fn gated_scan_gradients_match_finite_differences() {
 #[test]
 fn rms_norm_gradients_match_finite_differences() {
     let (r, d) = (3usize, 6usize);
-    let v: Vec<f32> = (0..r * d).map(|i| ((i * 29 % 17) as f32 / 17.0) - 0.4).collect();
+    let v: Vec<f32> = (0..r * d)
+        .map(|i| ((i * 29 % 17) as f32 / 17.0) - 0.4)
+        .collect();
     let x0 = Tensor::from_vec_f32(v, &[r, d]).unwrap();
-    let w: Vec<f32> = (0..r * d).map(|i| ((i * 11 % 5) as f32 / 5.0) + 0.3).collect();
+    let w: Vec<f32> = (0..r * d)
+        .map(|i| ((i * 11 % 5) as f32 / 5.0) + 0.3)
+        .collect();
     let wt = Tensor::from_vec_f32(w, &[r, d]).unwrap();
     let obj = |x: &Tensor| -> f32 {
         let y = rms_norm(x, 1e-5).unwrap();
-        g::mul(&y, &wt).unwrap().sum(None, false).unwrap().to_vec_f32().unwrap()[0]
+        g::mul(&y, &wt)
+            .unwrap()
+            .sum(None, false)
+            .unwrap()
+            .to_vec_f32()
+            .unwrap()[0]
     };
     let xg = x0.clone().with_requires_grad();
     let y = rms_norm(&xg, 1e-5).unwrap();

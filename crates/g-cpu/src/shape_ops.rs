@@ -1,5 +1,8 @@
 use g_core::{for_each_index, normalize_axis, numel, Dtype, Error, Result, Tensor};
 
+/// Concatenate tensors along `axis`.
+///
+/// All tensors must share a dtype, rank, and every dimension except `axis`.
 pub fn cat(tensors: &[&Tensor], axis: isize) -> Result<Tensor> {
     if tensors.is_empty() {
         return Err(Error::shape("cat", "need at least one tensor"));
@@ -48,6 +51,7 @@ pub fn cat(tensors: &[&Tensor], axis: isize) -> Result<Tensor> {
     }
 }
 
+/// Stack tensors along a new `axis` (rank increases by one).
 pub fn stack(tensors: &[&Tensor], axis: isize) -> Result<Tensor> {
     let unsqueezed: Result<Vec<Tensor>> = tensors.iter().map(|t| t.unsqueeze(axis)).collect();
     let u = unsqueezed?;
@@ -55,6 +59,7 @@ pub fn stack(tensors: &[&Tensor], axis: isize) -> Result<Tensor> {
     cat(&refs, axis)
 }
 
+/// Reduce `x` by max over `axis` (`keepdims` retains it as size 1).
 pub fn amax(x: &Tensor, axis: isize, keepdims: bool) -> Result<Tensor> {
     let ax = normalize_axis(axis, x.rank(), "amax")?;
     if x.shape()[ax] == 0 {

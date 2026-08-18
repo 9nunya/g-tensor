@@ -1,4 +1,15 @@
 //! Neural primitives and a small AdamW/SGD.
+//!
+//! Building blocks for training: linear layers, activations, softmax and
+//! losses, embeddings, and two optimizers. All differentiable functions build
+//! on [`g_ad`], so their results carry reverse-mode autodiff nodes when their
+//! inputs require gradients.
+//!
+//! # Optimizers
+//!
+//! [`Sgd`] and [`AdamW`] both return updated parameter tensors rather than
+//! mutating them, matching the library's functional style. Feed the returned
+//! tensors back as the parameters of the next step.
 
 use std::sync::Arc;
 
@@ -27,19 +38,24 @@ pub fn linear(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
     }
 }
 
+/// ReLU activation (delegates to [`g_ad::relu`]).
 pub fn relu(x: &Tensor) -> Result<Tensor> {
     g_ad::relu(x)
 }
 
+/// Tanh activation (delegates to [`g_ad::tanh`]).
 pub fn tanh(x: &Tensor) -> Result<Tensor> {
     g_ad::tanh(x)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// How a loss reduces over the batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reduce {
+    /// Divide by the number of elements.
     Mean,
+    /// Sum every element.
     Sum,
+    /// No reduction; keep per-element values.
     None,
 }
 
@@ -240,10 +256,12 @@ fn reduce_max(x: &Tensor, axis: usize) -> Result<Tensor> {
 
 /// `θ ← θ − lr · g`.
 pub struct Sgd {
+    /// Learning rate.
     pub lr: f64,
 }
 
 impl Sgd {
+    /// Apply one SGD update and return the new parameter values.
     pub fn step(&self, params: &[&Tensor], grads: &[Tensor]) -> Result<Vec<Tensor>> {
         if params.len() != grads.len() {
             return Err(Error::shape("sgd", "params/grads length"));
@@ -257,20 +275,26 @@ impl Sgd {
     }
 }
 
-/// Decoupled AdamW as in the PC dossier (record the equations).
 /// Decoupled AdamW. Call [`AdamW::step`] with the same param order as [`AdamW::new`].
 pub struct AdamW {
+    /// Learning rate.
     pub lr: f64,
+    /// First-moment decay.
     pub beta1: f64,
+    /// Second-moment decay.
     pub beta2: f64,
+    /// Numerical stability term.
     pub eps: f64,
+    /// Decoupled weight-decay coefficient.
     pub weight_decay: f64,
+    /// Number of completed steps (starts at 0, incremented on each step).
     pub step: i64,
     m: Vec<Tensor>,
     v: Vec<Tensor>,
 }
 
 impl AdamW {
+    /// Create an optimizer with zeroed first/second moments for `params`.
     pub fn new(
         params: &[&Tensor],
         lr: f64,
@@ -297,6 +321,7 @@ impl AdamW {
         })
     }
 
+    /// Apply one AdamW update and return the new parameter values.
     pub fn step(&mut self, params: &[&Tensor], grads: &[Tensor]) -> Result<Vec<Tensor>> {
         self.step += 1;
         let t = self.step as f64;

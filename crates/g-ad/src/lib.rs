@@ -1,4 +1,27 @@
-//! First-order reverse AD: `grad` primitive and scalar `backward`.
+//! First-order reverse AD.
+//!
+//! [`grad`] is functional: every call clears all reachable leaf slots before
+//! its reverse pass and returns only that output's gradients. [`backward`]
+//! intentionally accumulates into leaf slots until [`zero_grad`] is called.
+//!
+//! # Example
+//! ```
+//! use g_core::Tensor;
+//! # fn main() -> g_core::Result<()> {
+//! let x = Tensor::from_slice_f32(&[2.0], &[])?.with_requires_grad();
+//! let y = g_ad::mul(&x, &x)?; // x^2
+//! let g = g_ad::grad(&y, &[&x])?;
+//! assert!((g[0].item_f32()? - 4.0).abs() < 1e-6);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Semantics
+//!
+//! The reverse engine walks the graph as a DAG, so a node shared by several
+//! consumers is differentiated exactly once per pass. Tracked ops return
+//! tensors carrying [`Backward`] VJP nodes; when no input requires gradients
+//! the op simply calls the CPU kernel and stays off the tape.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -78,8 +101,8 @@ impl Backward for MatmulBw {
         &self.parents
     }
     fn backward(&self, gy: &Tensor) -> Result<Vec<Tensor>> {
-        let ga = g_cpu::matmul(gy, &self.b.transpose()?)?;
-        let gb = g_cpu::matmul(&self.a.transpose()?, gy)?;
+        let ga = matmul_backend(gy, &self.b.transpose()?)?;
+        let gb = matmul_backend(&self.a.transpose()?, gy)?;
         Ok(vec![
             unbroadcast(&ga, self.a.shape())?,
             unbroadcast(&gb, self.b.shape())?,
@@ -280,6 +303,7 @@ fn unbroadcast(g: &Tensor, target: &[usize]) -> Result<Tensor> {
     Ok(acc)
 }
 
+/// Tracked elementwise `a + b` with broadcasting.
 pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if !any_grad(&[a, b]) {
         return g_cpu::add(a, b);
@@ -296,6 +320,7 @@ pub fn add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Tracked elementwise `a - b` with broadcasting.
 pub fn sub(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if !any_grad(&[a, b]) {
         return g_cpu::sub(a, b);
@@ -312,6 +337,7 @@ pub fn sub(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Tracked elementwise `a * b` with broadcasting.
 pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if !any_grad(&[a, b]) {
         return g_cpu::mul(a, b);
@@ -328,6 +354,7 @@ pub fn mul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Tracked scalar multiply.
 pub fn mul_scalar(a: &Tensor, s: f64) -> Result<Tensor> {
     let b = match a.dtype() {
         Dtype::F32 => Tensor::scalar_f32(s as f32)?,
@@ -337,18 +364,163 @@ pub fn mul_scalar(a: &Tensor, s: f64) -> Result<Tensor> {
     mul(a, &b)
 }
 
+/// Tracked negation.
 pub fn neg(a: &Tensor) -> Result<Tensor> {
     mul_scalar(a, -1.0)
 }
 
-pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    if !any_grad(&[a, b]) {
-        return g_cpu::matmul(a, b);
+/// Matmul backend: MPSGraph for large FP32 GEMMs when the `gpu` feature is
+/// on, otherwise (and for everything below the crossover) the CPU kernel.
+fn matmul_backend(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "gpu")]
+    {
+        if g_apple::should_offload_matmul(a, b) {
+            // Use every Metal GPU and the CPU at the same time when the shape
+            // splits cleanly; fall back to GPU-only (single or multi) below.
+            if let Some(y) = matmul_cpu_gpu(a, b) {
+                if let Ok(y) = y {
+                    return Ok(y);
+                }
+            }
+            let y = if g_apple::gpu_device_count() > 1 {
+                g_apple::matmul_multi_device(a, b)
+            } else {
+                g_apple::matmul(a, b)
+            };
+            if let Ok(y) = y {
+                return Ok(y);
+            }
+        }
     }
-    let out = g_cpu::matmul(a, b)?;
+    g_cpu::matmul(a, b)
+}
+
+#[cfg(feature = "gpu")]
+/// Split a large GEMM between the CPU and all Metal GPUs.
+///
+/// Returns `None` when the shape is not cleanly sliceable (for example a
+/// broadcast batched matmul). Batched `[B,M,K] @ [K,N]` and rank-3 x rank-3
+/// split the batch axis; a single rank-2 GEMM splits its rows. The CPU takes
+/// about `1 / (gpu_count + 1)` of the work while the GPUs share the rest.
+fn matmul_cpu_gpu(a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
+    let gpu_count = g_apple::gpu_device_count();
+    if gpu_count == 0 {
+        return None;
+    }
+    let d = g_apple::matmul_shape(a, b)?;
+    // Matvec-style 1-D promotion does not reach the offload crossover anyway;
+    // requiring rank-2 operands keeps the split and concat axes trivial.
+    if d.left || d.right {
+        return None;
+    }
+
+    let total: usize = if a.rank() == 2 && b.rank() == 2 {
+        d.m
+    } else if a.rank() == 3 && b.rank() == 2 {
+        let batch = g_core::numel(&d.batch).ok()?;
+        if batch != a.shape()[0] {
+            return None;
+        }
+        batch
+    } else if a.rank() == 3 && b.rank() == 3 {
+        let batch = g_core::numel(&d.batch).ok()?;
+        if batch != a.shape()[0] || !(b.shape()[0] == batch || b.shape()[0] == 1) {
+            return None;
+        }
+        batch
+    } else {
+        return None;
+    };
+    if total < 2 {
+        return None;
+    }
+
+    // The CPU is one worker; each GPU is another. Give the CPU a roughly even
+    // share and let `matmul_multi_device` fan the rest out across all GPUs.
+    let parts = gpu_count + 1;
+    let cpu_end = total / parts;
+    if cpu_end == 0 || cpu_end == total {
+        return None;
+    }
+
+    let (cpu_a, cpu_b, gpu_a, gpu_b) = if a.rank() == 2 {
+        let ca = a
+            .slice(&[
+                (Some(0), Some(cpu_end as isize), Some(1)),
+                (None, None, None),
+            ])
+            .ok()?;
+        let ga = a
+            .slice(&[
+                (Some(cpu_end as isize), Some(total as isize), Some(1)),
+                (None, None, None),
+            ])
+            .ok()?;
+        (ca, b.clone(), ga, b.clone())
+    } else {
+        let ca = batch_slice(a, 0, cpu_end, total).ok()?;
+        let ga = batch_slice(a, cpu_end, total, total).ok()?;
+        let (cb, gb) = if b.rank() == 2 {
+            (b.clone(), b.clone())
+        } else {
+            (
+                batch_slice(b, 0, cpu_end, total).ok()?,
+                batch_slice(b, cpu_end, total, total).ok()?,
+            )
+        };
+        (ca, cb, ga, gb)
+    };
+
+    let (cpu_out, gpu_out) = std::thread::scope(|s| {
+        let cpu = s.spawn(|| g_cpu::matmul(&cpu_a, &cpu_b));
+        let gpu = s.spawn(|| g_apple::matmul_multi_device(&gpu_a, &gpu_b));
+        (cpu.join().unwrap(), gpu.join().unwrap())
+    });
+
+    let cpu_out = match cpu_out {
+        Ok(t) => t,
+        Err(e) => return Some(Err(e)),
+    };
+    let gpu_out = match gpu_out {
+        Ok(t) => t,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(g_cpu::cat(&[&cpu_out, &gpu_out], 0))
+}
+
+#[cfg(feature = "gpu")]
+fn batch_slice(t: &Tensor, start: usize, end: usize, total: usize) -> Result<Tensor> {
+    if t.rank() != 3 {
+        return Err(Error::shape("matmul_cpu_gpu", "expected rank-3 batch"));
+    }
+    if t.shape()[0] == total {
+        t.slice(&[
+            (Some(start as isize), Some(end as isize), Some(1)),
+            (None, None, None),
+            (None, None, None),
+        ])
+    } else if t.shape()[0] == 1 {
+        Ok(t.clone())
+    } else {
+        Err(Error::shape(
+            "matmul_cpu_gpu",
+            "batch broadcast is not cleanly sliceable",
+        ))
+    }
+}
+
+/// Tracked matrix multiply.
+///
+/// Large FP32 GEMMs can be offloaded to Metal (feature `gpu`), optionally
+/// split across the CPU and every GPU; the backward uses the same backend.
+pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let out = matmul_backend(a, b)?;
+    if !any_grad(&[a, b]) {
+        return Ok(out);
+    }
     Ok(maybe_track(
         out,
-        any_grad(&[a, b]),
+        true,
         Arc::new(MatmulBw {
             parents: vec![a.clone(), b.clone()],
             a: a.detach(),
@@ -357,6 +529,7 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Tracked ReLU (`max(x, 0)`; derivative 0 at 0).
 pub fn relu(a: &Tensor) -> Result<Tensor> {
     if !a.requires_grad() {
         return g_cpu::relu(a);
@@ -372,6 +545,7 @@ pub fn relu(a: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Tracked hyperbolic tangent.
 pub fn tanh(a: &Tensor) -> Result<Tensor> {
     if !a.requires_grad() {
         return g_cpu::tanh(a);
@@ -388,6 +562,7 @@ pub fn tanh(a: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Tracked summation over `axes` (`None` = all).
 pub fn sum(x: &Tensor, axes: Option<&[isize]>, keepdims: bool) -> Result<Tensor> {
     let axes_u: Vec<usize> = match axes {
         None => (0..x.rank()).collect(),
@@ -409,6 +584,7 @@ pub fn sum(x: &Tensor, axes: Option<&[isize]>, keepdims: bool) -> Result<Tensor>
     ))
 }
 
+/// Tracked arithmetic mean over `axes` (`None` = all).
 pub fn mean(x: &Tensor, axes: Option<&[isize]>, keepdims: bool) -> Result<Tensor> {
     let axes_u: Vec<usize> = match axes {
         None => (0..x.rank()).collect(),
@@ -454,8 +630,17 @@ pub fn detach(x: &Tensor) -> Tensor {
     x.detach()
 }
 
-/// Primitive: gradients of `output` w.r.t. `inputs` (must be leaves or graph nodes).
-/// Gradients of scalar `output` w.r.t. `inputs` (must be `requires_grad` leaves).
+/// Functional gradients of scalar `output` with respect to `inputs`.
+///
+/// Every call is fresh: before the reverse pass, stored gradients are cleared
+/// for every unique leaf reachable from `output` (including reachable leaves
+/// not listed in `inputs`). Unreachable requested leaves are also cleared and
+/// return zeros. The gradients from this call remain stored on the leaves
+/// after return, but they cannot leak into the next call to `grad`.
+///
+/// Unlike [`backward`], this function never returns historical accumulation,
+/// so calling [`zero_grad`] first is allowed but redundant. Every input must be
+/// a `requires_grad` leaf.
 pub fn grad(output: &Tensor, inputs: &[&Tensor]) -> Result<Vec<Tensor>> {
     if output.numel() != 1 {
         return Err(Error::shape("grad", "output must be a scalar (numel==1)"));
@@ -463,17 +648,8 @@ pub fn grad(output: &Tensor, inputs: &[&Tensor]) -> Result<Vec<Tensor>> {
     if !output.dtype().is_float() {
         return Err(Error::dtype("grad", "float output"));
     }
-    let seed = Tensor::ones(output.shape(), output.dtype())?;
-    accumulate(output, &seed)?;
-    let mut out = Vec::with_capacity(inputs.len());
     for inp in inputs {
-        if let Some(leaf) = inp.leaf() {
-            let g = leaf.grad.lock().unwrap();
-            out.push(match &*g {
-                Some(t) => t.clone(),
-                None => Tensor::zeros(inp.shape(), inp.dtype())?,
-            });
-        } else {
+        if inp.leaf().is_none() {
             return Err(Error::new(
                 g_core::ErrorKind::Domain,
                 "grad",
@@ -481,10 +657,45 @@ pub fn grad(output: &Tensor, inputs: &[&Tensor]) -> Result<Vec<Tensor>> {
             ));
         }
     }
+
+    let seed = Tensor::ones(output.shape(), output.dtype())?;
+
+    // `accumulate` necessarily touches all reachable leaves, not just the
+    // requested inputs. Clear their persistent slots as one functional call.
+    let mut leaves = Vec::new();
+    let mut seen_leaves = HashSet::new();
+    collect_leaves(output, &mut leaves, &mut seen_leaves);
+    for inp in inputs {
+        let leaf = inp.leaf().expect("grad inputs were validated above");
+        let key = Arc::as_ptr(leaf) as usize;
+        if seen_leaves.insert(key) {
+            leaves.push((*inp).clone());
+        }
+    }
+    for leaf_t in &leaves {
+        if let Some(leaf) = leaf_t.leaf() {
+            *leaf.grad.lock().unwrap() = None;
+        }
+    }
+
+    accumulate(output, &seed)?;
+    let mut out = Vec::with_capacity(inputs.len());
+    for inp in inputs {
+        let leaf = inp.leaf().expect("grad inputs were validated above");
+        let g = leaf.grad.lock().unwrap();
+        out.push(match &*g {
+            Some(t) => t.clone(),
+            None => Tensor::zeros(inp.shape(), inp.dtype())?,
+        });
+    }
     Ok(out)
 }
 
-/// Walk the graph of a scalar and return `(leaf, grad)` pairs.
+/// Run an accumulating reverse pass and return reachable `(leaf, grad)` pairs.
+///
+/// Unlike [`grad`], each call adds into gradients already stored on the
+/// leaves. Call [`zero_grad`] to reset those slots when a fresh accumulating
+/// sequence is needed.
 pub fn backward(output: &Tensor) -> Result<Vec<(Tensor, Tensor)>> {
     if output.numel() != 1 {
         return Err(Error::shape("backward", "output must be a scalar"));
@@ -507,16 +718,27 @@ pub fn backward(output: &Tensor) -> Result<Vec<(Tensor, Tensor)>> {
     Ok(pairs)
 }
 
-fn collect_leaves(t: &Tensor, out: &mut Vec<Tensor>, seen: &mut HashSet<usize>) {
-    if let Some(leaf) = t.leaf() {
-        let k = Arc::as_ptr(leaf) as usize;
-        if seen.insert(k) {
-            out.push(t.clone());
+/// Collect each reachable leaf once without re-walking shared DAG nodes.
+fn collect_leaves(t: &Tensor, out: &mut Vec<Tensor>, seen_leaves: &mut HashSet<usize>) {
+    let mut seen_nodes = HashSet::new();
+    let mut stack = vec![t.clone()];
+    while let Some(node) = stack.pop() {
+        let Some(key) = node_key(&node) else {
+            continue;
+        };
+        if !seen_nodes.insert(key) {
+            continue;
         }
-    }
-    if let Some(gf) = t.grad_fn() {
-        for p in gf.parents() {
-            collect_leaves(p, out, seen);
+        if let Some(leaf) = node.leaf() {
+            let leaf_key = Arc::as_ptr(leaf) as usize;
+            if seen_leaves.insert(leaf_key) {
+                out.push(node.clone());
+            }
+        }
+        if let Some(gf) = node.grad_fn() {
+            for parent in gf.parents().iter().rev() {
+                stack.push(parent.clone());
+            }
         }
     }
 }
@@ -589,7 +811,9 @@ fn accumulate(output: &Tensor, seed: &Tensor) -> Result<()> {
                 ));
             }
             for (parent, part) in parents.iter().zip(parts.iter()) {
-                let Some(pk) = node_key(parent) else { continue };
+                let Some(pk) = node_key(parent) else {
+                    continue;
+                };
                 let next = match grads.remove(&pk) {
                     Some(prev) => g_cpu::add(&prev, part)?,
                     None => part.clone(),
@@ -602,6 +826,9 @@ fn accumulate(output: &Tensor, seed: &Tensor) -> Result<()> {
 }
 
 /// Clear accumulated leaf gradients.
+///
+/// This remains useful for [`backward`] accumulation and is backward
+/// compatible, but calling it before functional [`grad`] is redundant.
 pub fn zero_grad(inputs: &[&Tensor]) {
     for inp in inputs {
         if let Some(leaf) = inp.leaf() {
@@ -650,6 +877,7 @@ fn unary_track(name: &'static str, x: &Tensor, y: Tensor, local: Tensor) -> Tens
     )
 }
 
+/// Tracked elementwise division `a / b`.
 pub fn div(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let out = g_cpu::div(a, b)?;
     if !any_grad(&[a, b]) {
@@ -693,6 +921,7 @@ pub fn div(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Tracked elementwise exponential.
 pub fn exp(x: &Tensor) -> Result<Tensor> {
     if !x.requires_grad() {
         return g_cpu::exp(x);
@@ -702,6 +931,7 @@ pub fn exp(x: &Tensor) -> Result<Tensor> {
     Ok(unary_track("exp", x, y, saved))
 }
 
+/// Tracked elementwise natural logarithm.
 pub fn log(x: &Tensor) -> Result<Tensor> {
     if !x.requires_grad() {
         return g_cpu::log(x);
@@ -711,6 +941,7 @@ pub fn log(x: &Tensor) -> Result<Tensor> {
     Ok(unary_track("log", x, y, inv))
 }
 
+/// Tracked elementwise square root.
 pub fn sqrt(x: &Tensor) -> Result<Tensor> {
     if !x.requires_grad() {
         return g_cpu::sqrt(x);
@@ -724,6 +955,7 @@ pub fn sqrt(x: &Tensor) -> Result<Tensor> {
     Ok(unary_track("sqrt", x, y, half))
 }
 
+/// Tracked elementwise absolute value (derivative sign(x)).
 pub fn abs(x: &Tensor) -> Result<Tensor> {
     if !x.requires_grad() {
         return g_cpu::abs(x);
@@ -732,6 +964,7 @@ pub fn abs(x: &Tensor) -> Result<Tensor> {
     Ok(unary_track("abs", x, y, g_cpu::sign(&x.detach())?))
 }
 
+/// Tracked logistic sigmoid.
 pub fn sigmoid(x: &Tensor) -> Result<Tensor> {
     if !x.requires_grad() {
         return g_cpu::sigmoid(x);
@@ -743,6 +976,7 @@ pub fn sigmoid(x: &Tensor) -> Result<Tensor> {
     Ok(unary_track("sigmoid", x, y, local))
 }
 
+/// Tracked SiLU `x * sigmoid(x)`.
 pub fn silu(x: &Tensor) -> Result<Tensor> {
     if !x.requires_grad() {
         return g_cpu::silu(x);
@@ -758,6 +992,7 @@ pub fn silu(x: &Tensor) -> Result<Tensor> {
     Ok(unary_track("silu", x, y, local))
 }
 
+/// Tracked GELU (tanh approximation).
 pub fn gelu(x: &Tensor) -> Result<Tensor> {
     if !x.requires_grad() {
         return g_cpu::gelu(x);
@@ -788,6 +1023,7 @@ pub fn gelu(x: &Tensor) -> Result<Tensor> {
     Ok(unary_track("gelu", x, y, u))
 }
 
+/// Tracked softplus.
 pub fn softplus(x: &Tensor) -> Result<Tensor> {
     if !x.requires_grad() {
         return g_cpu::softplus(x);
@@ -796,6 +1032,7 @@ pub fn softplus(x: &Tensor) -> Result<Tensor> {
     Ok(unary_track("softplus", x, y, g_cpu::sigmoid(&x.detach())?))
 }
 
+/// Tracked leaky ReLU.
 pub fn leaky_relu(x: &Tensor, slope: f64) -> Result<Tensor> {
     if !x.requires_grad() {
         return g_cpu::leaky_relu(x, slope);
@@ -819,6 +1056,7 @@ pub fn leaky_relu(x: &Tensor, slope: f64) -> Result<Tensor> {
     Ok(unary_track("leaky_relu", x, y, local))
 }
 
+/// Tracked clamp to `[min, max]`.
 pub fn clamp(x: &Tensor, min: f64, max: f64) -> Result<Tensor> {
     if !x.requires_grad() {
         return g_cpu::clamp(x, min, max);
@@ -852,6 +1090,7 @@ pub fn clamp(x: &Tensor, min: f64, max: f64) -> Result<Tensor> {
     Ok(unary_track("clamp", x, y, local))
 }
 
+/// Tracked unsqueeze (insert a size-1 axis).
 pub fn unsqueeze(x: &Tensor, axis: isize) -> Result<Tensor> {
     let y = x.unsqueeze(axis)?;
     if !x.requires_grad() {
@@ -882,6 +1121,7 @@ pub fn unsqueeze(x: &Tensor, axis: isize) -> Result<Tensor> {
     ))
 }
 
+/// Tracked concatenation along `axis`.
 pub fn cat(tensors: &[&Tensor], axis: isize) -> Result<Tensor> {
     let y = g_cpu::cat(tensors, axis)?;
     if !tensors.iter().any(|t| t.requires_grad()) {
@@ -925,6 +1165,7 @@ pub fn cat(tensors: &[&Tensor], axis: isize) -> Result<Tensor> {
     ))
 }
 
+/// Tracked stack along a new axis.
 pub fn stack(tensors: &[&Tensor], axis: isize) -> Result<Tensor> {
     let u: Result<Vec<Tensor>> = tensors.iter().map(|t| unsqueeze(t, axis)).collect();
     let u = u?;
@@ -932,6 +1173,7 @@ pub fn stack(tensors: &[&Tensor], axis: isize) -> Result<Tensor> {
     cat(&refs, axis)
 }
 
+/// Tracked gather along `axis` (gradient is a scatter-add).
 pub fn gather(x: &Tensor, axis: isize, index: &Tensor) -> Result<Tensor> {
     let y = g_cpu::gather(x, axis, index)?;
     if !x.requires_grad() {
@@ -967,6 +1209,7 @@ pub fn gather(x: &Tensor, axis: isize, index: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Tracked max reduction over `axis` (ties route to the first max).
 pub fn amax(x: &Tensor, axis: isize, keepdims: bool) -> Result<Tensor> {
     let y = g_cpu::amax(x, axis, keepdims)?;
     if !x.requires_grad() {
@@ -1075,16 +1318,19 @@ pub fn jvp_identity_check(
     Ok(0.0)
 }
 
+/// Population variance over `axes` (`None` = all).
 pub fn variance(x: &Tensor, axes: Option<&[isize]>, keepdims: bool) -> Result<Tensor> {
     let m = mean(x, axes, true)?;
     let xc = sub(x, &m)?;
     mean(&mul(&xc, &xc)?, axes, keepdims)
 }
 
+/// Population standard deviation over `axes` (`None` = all).
 pub fn stddev(x: &Tensor, axes: Option<&[isize]>, keepdims: bool) -> Result<Tensor> {
     sqrt(&variance(x, axes, keepdims)?)
 }
 
+/// Numerically stable log-sum-exp over `axis`.
 pub fn logsumexp(x: &Tensor, axis: isize, keepdims: bool) -> Result<Tensor> {
     let ax = g_core::normalize_axis(axis, x.rank(), "logsumexp")?;
     let m = g_cpu::amax(x, axis, true)?;
@@ -1098,6 +1344,7 @@ pub fn logsumexp(x: &Tensor, axis: isize, keepdims: bool) -> Result<Tensor> {
     }
 }
 
+/// Elementwise maximum `max(a, b)` (differentiable through both args).
 pub fn maximum(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     // (a+b+|a-b|)/2
     let s = add(a, b)?;
@@ -1105,12 +1352,14 @@ pub fn maximum(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     mul_scalar(&add(&s, &d)?, 0.5)
 }
 
+/// Elementwise minimum `min(a, b)` (differentiable through both args).
 pub fn minimum(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let s = add(a, b)?;
     let d = abs(&sub(a, b)?)?;
     mul_scalar(&sub(&s, &d)?, 0.5)
 }
 
+/// Tracked `take` along `axis` (v1: rank-2, axis 1 only).
 pub fn take(x: &Tensor, axis: isize, index: &Tensor) -> Result<Tensor> {
     let y = g_cpu::take(x, axis, index)?;
     if !x.requires_grad() {
@@ -1176,8 +1425,11 @@ pub fn slice_tracked(
             let mut full = Tensor::zeros(&self.x_shape, gy.dtype())?;
             full.make_unique()?;
             let view = full.slice(&self.ranges)?;
-            let (voff, vshape, vstrides) =
-                (view.storage_offset(), view.shape().to_vec(), view.strides().to_vec());
+            let (voff, vshape, vstrides) = (
+                view.storage_offset(),
+                view.shape().to_vec(),
+                view.strides().to_vec(),
+            );
             drop(view);
             let gyv = gy.to_vec_f32()?;
             let store = full.as_mut_slice_f32()?;
@@ -1198,6 +1450,7 @@ pub fn slice_tracked(
     Ok(y)
 }
 
+/// Tracked transpose of the last two axes.
 pub fn transpose(x: &Tensor) -> Result<Tensor> {
     let y = x.transpose()?;
     if !x.requires_grad() {
@@ -1226,6 +1479,7 @@ pub fn transpose(x: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Tracked reshape (one `-1` wildcard allowed).
 pub fn reshape(x: &Tensor, shape: &[isize]) -> Result<Tensor> {
     let y = x.reshape(shape)?;
     if !x.requires_grad() {
@@ -1299,6 +1553,149 @@ mod tests {
     }
 
     #[test]
+    fn grad_is_fresh_across_rebuilt_graphs() {
+        let x = Tensor::from_slice_f32(&[3.0], &[])
+            .unwrap()
+            .with_requires_grad();
+
+        let y0 = mul(&x, &x).unwrap();
+        let g0 = grad(&y0, &[&x]).unwrap();
+        let y1 = mul(&x, &x).unwrap();
+        let g1 = grad(&y1, &[&x]).unwrap();
+
+        assert_eq!(g0[0].item_f32().unwrap(), 6.0);
+        assert_eq!(g1[0].item_f32().unwrap(), 6.0);
+    }
+
+    #[test]
+    fn backward_accumulates_until_zeroed() {
+        let x = Tensor::from_slice_f32(&[2.0], &[])
+            .unwrap()
+            .with_requires_grad();
+
+        let first = backward(&mul(&x, &x).unwrap()).unwrap();
+        assert_eq!(first[0].1.item_f32().unwrap(), 4.0);
+        let second = backward(&mul(&x, &x).unwrap()).unwrap();
+        assert_eq!(second[0].1.item_f32().unwrap(), 8.0);
+
+        zero_grad(&[&x]);
+        let after_zero = backward(&mul(&x, &x).unwrap()).unwrap();
+        assert_eq!(after_zero[0].1.item_f32().unwrap(), 4.0);
+    }
+
+    #[test]
+    fn grad_clears_every_reachable_leaf_and_sums_shared_dag() {
+        let x = Tensor::from_slice_f32(&[2.0], &[])
+            .unwrap()
+            .with_requires_grad();
+        let y = Tensor::from_slice_f32(&[3.0], &[])
+            .unwrap()
+            .with_requires_grad();
+        let unrequested = Tensor::from_slice_f32(&[5.0], &[])
+            .unwrap()
+            .with_requires_grad();
+
+        // Poison an unrequested leaf with an explicitly accumulated gradient.
+        backward(&mul(&unrequested, &unrequested).unwrap()).unwrap();
+        assert_eq!(
+            unrequested
+                .leaf()
+                .unwrap()
+                .grad
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .item_f32()
+                .unwrap(),
+            10.0
+        );
+
+        // The shared node must still sum both paths within this one DAG.
+        let shared = add(&x, &y).unwrap();
+        let output = add(&mul(&shared, &shared).unwrap(), &unrequested).unwrap();
+        let gs = grad(&output, &[&x, &y]).unwrap();
+        assert_eq!(gs[0].item_f32().unwrap(), 10.0);
+        assert_eq!(gs[1].item_f32().unwrap(), 10.0);
+
+        // Although it was not requested, this reachable leaf was touched by
+        // reverse mode and therefore must contain only this call's gradient.
+        assert_eq!(
+            unrequested
+                .leaf()
+                .unwrap()
+                .grad
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .item_f32()
+                .unwrap(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn grad_returns_zero_for_a_stale_disconnected_input() {
+        let connected = Tensor::from_slice_f32(&[2.0], &[])
+            .unwrap()
+            .with_requires_grad();
+        let disconnected = Tensor::from_slice_f32(&[4.0], &[])
+            .unwrap()
+            .with_requires_grad();
+
+        backward(&mul(&disconnected, &disconnected).unwrap()).unwrap();
+        let output = mul(&connected, &connected).unwrap();
+        let gs = grad(&output, &[&connected, &disconnected]).unwrap();
+
+        assert_eq!(gs[0].item_f32().unwrap(), 4.0);
+        assert_eq!(gs[1].item_f32().unwrap(), 0.0);
+        assert!(disconnected.leaf().unwrap().grad.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn fresh_grad_has_positive_convex_same_batch_secant() {
+        let mut p = Tensor::from_slice_f32(&[1.0, -2.0, 0.5], &[3])
+            .unwrap()
+            .with_requires_grad();
+
+        let g0 = {
+            let square = mul(&p, &p).unwrap();
+            let loss = mul_scalar(&sum(&square, None, false).unwrap(), 0.5).unwrap();
+            grad(&loss, &[&p]).unwrap().remove(0)
+        };
+        let p0 = p.to_vec_f32().unwrap();
+        let g0v = g0.to_vec_f32().unwrap();
+
+        // Keep the same leaf/gradient slot while stepping the persistent
+        // parameter along -g0, just as a same-batch secant probe does.
+        let step_size = 0.1_f32;
+        p.make_unique().unwrap();
+        for (value, &g) in p.as_mut_slice_f32().unwrap().iter_mut().zip(&g0v) {
+            *value -= step_size * g;
+        }
+        let p1 = p.to_vec_f32().unwrap();
+
+        let g1 = {
+            let square = mul(&p, &p).unwrap();
+            let loss = mul_scalar(&sum(&square, None, false).unwrap(), 0.5).unwrap();
+            grad(&loss, &[&p]).unwrap().remove(0)
+        };
+        let g1v = g1.to_vec_f32().unwrap();
+
+        let secant: f32 = p1
+            .iter()
+            .zip(&p0)
+            .zip(g1v.iter().zip(&g0v))
+            .map(|((&new_p, &old_p), (&new_g, &old_g))| (new_p - old_p) * (new_g - old_g))
+            .sum();
+        // Historical accumulation made g1 = grad(p0) + grad(p1), producing
+        // -0.4725 here instead of the fresh quadratic secant +0.0525.
+        assert!(secant > 0.0, "convex same-batch secant was {secant}");
+        assert!((secant - 0.0525).abs() < 1e-5);
+    }
+
+    #[test]
     fn stop_gradient_zeros() {
         let x = Tensor::from_slice_f32(&[3.0], &[])
             .unwrap()
@@ -1308,7 +1705,6 @@ mod tests {
         assert_eq!(g[0].item_f32().unwrap(), 0.0);
     }
 }
-
 
 struct ScanBw {
     parents: Vec<Tensor>,
@@ -1434,9 +1830,10 @@ impl Backward for MaskedCeBw {
 
 /// Masked cross-entropy as a single autodiff node.
 ///
-/// `logits` is `[N, V]`, `targets` `[N]` (i64), `mask` `[N]` (f32, 1.0 =
-/// scored). Positions with mask 0 contribute nothing to loss or gradient, so
-/// one loss function covers context-heavy samples (observations are masked).
+/// `logits` is `[N, V]`, `targets` `[N]` (i64), and `mask` `[N]` contains
+/// signed row weights. The loss is normalized by `sum(abs(mask))`; zero rows
+/// contribute nothing, while negative rows reverse the gradient (useful for
+/// policy-gradient advantages).
 pub fn masked_ce(logits: &Tensor, targets: &Tensor, mask: &Tensor) -> Result<Tensor> {
     let (loss, probs) = g_cpu::masked_ce(logits, targets, mask)?;
     if !logits.requires_grad() {
@@ -1448,6 +1845,86 @@ pub fn masked_ce(logits: &Tensor, targets: &Tensor, mask: &Tensor) -> Result<Ten
         probs,
         targets: targets.detach(),
         mask: mask.detach(),
+    }));
+    Ok(y)
+}
+
+struct FusedBlockBw {
+    parents: Vec<Tensor>,
+    aux: g_cpu::FusedAux,
+    wa: Tensor,
+    wb: Tensor,
+    wo: Tensor,
+    wf1: Tensor,
+    wf2: Tensor,
+    g1: Tensor,
+    g2: Tensor,
+    g3: Tensor,
+    g4: Tensor,
+    eps: f32,
+}
+impl Backward for FusedBlockBw {
+    fn name(&self) -> &'static str {
+        "fused_block"
+    }
+    fn parents(&self) -> &[Tensor] {
+        &self.parents
+    }
+    fn backward(&self, gy: &Tensor) -> Result<Vec<Tensor>> {
+        let gs = g_cpu::fused_block_bwd(
+            &self.aux, &self.wa, &self.wb, &self.wo, &self.wf1, &self.wf2, &self.g1, &self.g2,
+            &self.g3, &self.g4, self.eps, gy,
+        )?;
+        Ok(vec![
+            gs.0, gs.1, gs.2, gs.3, gs.4, gs.5, gs.6, gs.7, gs.8, gs.9,
+        ])
+    }
+}
+
+/// The fused HELIX layer block as ONE autodiff node. See `g_cpu::fused_block_fwd`.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_block(
+    x: &Tensor,
+    wa: &Tensor,
+    wb: &Tensor,
+    wo: &Tensor,
+    wf1: &Tensor,
+    wf2: &Tensor,
+    g1: &Tensor,
+    g2: &Tensor,
+    g3: &Tensor,
+    g4: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    let (y, aux) = g_cpu::fused_block_fwd(x, wa, wb, wo, wf1, wf2, g1, g2, g3, g4, eps)?;
+    if !any_grad(&[x, wa, wb, wo, wf1, wf2, g1, g2, g3, g4]) {
+        return Ok(y);
+    }
+    let mut y = y;
+    y.set_grad_fn(Arc::new(FusedBlockBw {
+        parents: vec![
+            x.clone(),
+            wa.clone(),
+            wb.clone(),
+            wo.clone(),
+            wf1.clone(),
+            wf2.clone(),
+            g1.clone(),
+            g2.clone(),
+            g3.clone(),
+            g4.clone(),
+        ],
+        aux,
+        wa: wa.detach(),
+        wb: wb.detach(),
+        wo: wo.detach(),
+        wf1: wf1.detach(),
+        wf2: wf2.detach(),
+        g1: g1.detach(),
+        g2: g2.detach(),
+        g3: g3.detach(),
+        g4: g4.detach(),
+        eps,
     }));
     Ok(y)
 }

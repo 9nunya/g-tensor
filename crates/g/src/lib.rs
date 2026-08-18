@@ -1,8 +1,9 @@
-//! CPU-first tensor and autodiff library for Apple Silicon Macs.
+//! CPU-first tensor and autodiff library for Apple Silicon and Intel Macs.
 //!
 //! `g` is **not** a PyTorch clone. Ops return [`Result`], in-place mutation
 //! requires unique ownership, and small/medium work stays on the CPU because
-//! that is what is fast on an M3-class machine.
+//! that is what is fast on an M3-class machine. Large FP32 matrix multiplies
+//! can optionally run on Metal (see [GPU](#gpu-backend-feature-gpu)).
 //!
 //! # Quick start
 //! ```
@@ -18,11 +19,45 @@
 //! # }
 //! ```
 //!
+//! # Tensor model
+//!
+//! [`Tensor`] is a cheap reference-counted handle over shared storage plus a
+//! shape, strides, and offset. Cloning and view ops ([`Tensor::slice`],
+//! [`Tensor::permute`], [`Tensor::broadcast_to`]) are O(1). Use
+//! [`Tensor::to_contiguous`] or [`Tensor::copy`] when you need packed,
+//! uniquely-owned bytes. Every op returns a `Result`; errors carry a
+//! [`ErrorKind`], the op name, and a message.
+//!
 //! Free functions (`add`, `matmul`, …) are the primitives. [`TensorExt`] is
 //! method sugar for the same functions.
 //!
-//! Enable `cpu-accelerate` for Accelerate GEMM and `gpu` for large FP32
-//! MPSGraph matmuls. Neither changes the default small-op placement.
+//! # Reverse AD
+//!
+//! Mark parameters with [`Tensor::with_requires_grad`]. [`grad`] is functional
+//! and fresh on every call, even when leaf tensors persist between graphs;
+//! [`backward`] explicitly accumulates until [`zero_grad`] is called. The
+//! engine is first-order reverse mode over a DAG, so a shared subexpression's
+//! VJP runs exactly once. Fused ops ([`gated_scan`], [`rms_norm`],
+//! [`masked_ce`], [`fused_block`]) keep long recurrences to one graph node.
+//!
+//! # Features
+//!
+//! - `cpu-accelerate`: link Apple's Accelerate framework for BLAS GEMM and
+//!   vForce transcendentals on CPU.
+//! - `gpu`: large FP32 GEMMs on Metal via MPSGraph, including multi-device
+//!   and CPU + GPU splitting.
+//!
+//! Neither feature changes the default placement for small ops.
+//!
+//! # GPU backend (feature `gpu`)
+//!
+//! Enable the feature to route large FP32 GEMMs to Metal. The backend works on
+//! Apple Silicon and on Intel Macs with Metal devices (for example an AMD
+//! Radeon dGPU plus an Intel UHD iGPU). A discrete GPU is preferred; Intel
+//! iGPUs are excluded by default when a dGPU exists but can be re-enabled with
+//! `set_include_integrated`. When a GEMM splits cleanly, the matmul backend
+//! runs the CPU and every eligible GPU in parallel. Inspect the environment
+//! with `gpu_available`, `gpu_device_count`, and `gpu_device_names`.
 //!
 //! First-order reverse AD only. Unrolled / implicit PC is not in 0.1.
 
@@ -33,7 +68,10 @@ pub use g_core::{
 };
 
 #[doc(inline)]
-pub use g_ad::{backward, detach, embedding_fused, gated_scan, grad, masked_ce, rms_norm, slice_tracked, stop_gradient, zero_grad};
+pub use g_ad::{
+    backward, detach, embedding_fused, fused_block, gated_scan, grad, masked_ce, rms_norm,
+    slice_tracked, stop_gradient, zero_grad,
+};
 #[doc(inline)]
 pub use g_nn::{
     categorical_entropy, categorical_log_prob, cross_entropy, embedding, layer_norm, linear,
@@ -68,14 +106,6 @@ pub fn neg(a: &Tensor) -> Result<Tensor> {
 /// `(k,)@(k,)→()` / matvec rules. Large FP32 GEMMs may run on MPSGraph
 /// when the `gpu` feature is on; small/medium work stays on CPU.
 pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "gpu")]
-    {
-        if g_apple::should_offload_matmul(a, b) {
-            if let Ok(y) = g_apple::matmul(a, b) {
-                return Ok(y);
-            }
-        }
-    }
     g_ad::matmul(a, b)
 }
 /// `max(x, 0)`. Subgradient at 0 is **0**.
@@ -302,12 +332,48 @@ impl TensorExt for Tensor {
 #[cfg(feature = "gpu")]
 pub use g_apple;
 
+/// Whether any Metal device is available for GPU GEMMs.
+#[cfg(feature = "gpu")]
+pub fn gpu_available() -> bool {
+    g_apple::gpu_available()
+}
+
+/// Number of Metal devices the GEMM path will use in parallel.
+#[cfg(feature = "gpu")]
+pub fn gpu_device_count() -> usize {
+    g_apple::gpu_device_count()
+}
+
+/// Name of the Metal device that [`matmul`] will use for GPU GEMMs.
+#[cfg(feature = "gpu")]
+pub fn gpu_device_name() -> Option<String> {
+    g_apple::gpu_device_name()
+}
+
+/// Names of the Metal devices used for GEMM compute, best first.
+#[cfg(feature = "gpu")]
+pub fn gpu_device_names() -> Vec<String> {
+    g_apple::gpu_device_names()
+}
+
+/// Names of every Metal device visible to the process, best first.
+#[cfg(feature = "gpu")]
+pub fn gpu_all_device_names() -> Vec<String> {
+    g_apple::gpu_all_device_names()
+}
+
+/// Opt into running GEMMs on Intel iGPUs as well as the discrete GPU.
+#[cfg(feature = "gpu")]
+pub fn set_include_integrated(include: bool) {
+    g_apple::set_include_integrated(include);
+}
+
 /// Common imports: [`Tensor`], [`TensorExt`], constructors, and a few ops.
 pub mod prelude {
     pub use crate::TensorExt;
     pub use crate::{
         add, arange_f32, backward, cat, cross_entropy, detach, from_slice_f32, gated_scan, gelu,
-        grad, linear, matmul, mse_loss, randn_f32, relu, rms_norm, sigmoid, softmax,
-        stop_gradient, sum, tanh, zeros, Device, Dtype, Reduce, Result, Tensor,
+        grad, linear, matmul, mse_loss, randn_f32, relu, rms_norm, sigmoid, softmax, stop_gradient,
+        sum, tanh, zeros, Device, Dtype, Reduce, Result, Tensor,
     };
 }

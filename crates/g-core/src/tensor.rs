@@ -6,13 +6,18 @@ use crate::device::Device;
 use crate::dtype::Dtype;
 use crate::error::{Error, ErrorKind, Result};
 use crate::shape::{
-    broadcast_shapes, broadcast_strides, is_contiguous,
-    normalize_axis, numel, offset_of, resolve_reshape, row_major_strides,
+    broadcast_shapes, broadcast_strides, is_contiguous, normalize_axis, numel, offset_of,
+    resolve_reshape, row_major_strides,
 };
 use crate::storage::{Storage, StorageData, StorageRef};
 
+/// Gradient accumulator for a reverse-AD leaf tensor.
+///
+/// The mutex lets the tape write into the accumulator while the tensor itself
+/// remains `Clone`-able and `Send`.
 #[derive(Debug)]
 pub struct Leaf {
+    /// Accumulated gradient (`None` until the first backward pass).
     pub grad: Mutex<Option<Tensor>>,
 }
 
@@ -622,7 +627,6 @@ impl Tensor {
         self.permute(&axes)
     }
 
-    /// Basic slice. `ranges` is (start, end, step) per axis; None means full axis.
     /// Basic slice. Each triple is `(start, end, step)`; `None` means default. Negative step allowed.
     pub fn slice(&self, ranges: &[(Option<isize>, Option<isize>, Option<isize>)]) -> Result<Self> {
         if ranges.len() > self.rank() {
@@ -691,7 +695,6 @@ impl Tensor {
         Ok(t)
     }
 
-    /// Integer index on one axis (drops the axis).
     /// Integer index on one axis (drops that axis). OOB errors.
     pub fn select(&self, axis: isize, index: isize) -> Result<Self> {
         let ax = normalize_axis(axis, self.rank(), "select")?;

@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 
+/// Product of `shape`, saturating to an error on overflow.
 pub fn numel(shape: &[usize]) -> Result<usize> {
     shape
         .iter()
@@ -7,6 +8,10 @@ pub fn numel(shape: &[usize]) -> Result<usize> {
         .ok_or_else(|| Error::shape("numel", "shape volume overflow"))
 }
 
+/// Row-major (C-order) strides for `shape`.
+///
+/// The last axis has stride 1, the second-to-last stride `shape[last]`, and
+/// so on. This is the canonical contiguous layout used throughout the crate.
 pub fn row_major_strides(shape: &[usize]) -> Vec<isize> {
     let mut strides = vec![0isize; shape.len()];
     let mut acc = 1isize;
@@ -17,6 +22,7 @@ pub fn row_major_strides(shape: &[usize]) -> Vec<isize> {
     strides
 }
 
+/// Whether `shape`/`strides`/`offset` describe the canonical row-major layout.
 pub fn is_contiguous(shape: &[usize], strides: &[isize], offset: usize) -> bool {
     if offset != 0 {
         return false;
@@ -55,6 +61,11 @@ pub fn broadcast_shapes(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
     Ok(out)
 }
 
+/// Strides for viewing `from_shape`/`from_strides` as the broadcasted
+/// `to_shape`.
+///
+/// Size-1 (or padding) dimensions get stride 0 so every element of that axis
+/// maps to the same storage location.
 pub fn broadcast_strides(
     from_shape: &[usize],
     from_strides: &[isize],
@@ -75,6 +86,7 @@ pub fn broadcast_strides(
     Ok(strides)
 }
 
+/// Normalize a possibly-negative axis into a valid `0..rank` index.
 pub fn normalize_axis(axis: isize, rank: usize, op: &'static str) -> Result<usize> {
     let r = rank as isize;
     let a = if axis < 0 { axis + r } else { axis };
@@ -85,6 +97,10 @@ pub fn normalize_axis(axis: isize, rank: usize, op: &'static str) -> Result<usiz
     }
 }
 
+/// Resolve a reshape target with a single `-1` wildcard into concrete dims.
+///
+/// Returns an error on negative dims other than `-1`, on more than one `-1`,
+/// and on a numel mismatch.
 pub fn resolve_reshape(old_shape: &[usize], new: &[isize], op: &'static str) -> Result<Vec<usize>> {
     let old_numel = numel(old_shape)?;
     let mut infer = None;
@@ -141,6 +157,8 @@ pub fn resolve_reshape(old_shape: &[usize], new: &[isize], op: &'static str) -> 
     Ok(out)
 }
 
+/// Storage offset of the element at `index`, given the view's `offset` and
+/// `strides`.
 pub fn offset_of(index: &[usize], offset: usize, strides: &[isize]) -> usize {
     let mut o = offset as isize;
     for (&i, &s) in index.iter().zip(strides) {
@@ -149,6 +167,10 @@ pub fn offset_of(index: &[usize], offset: usize, strides: &[isize]) -> usize {
     o as usize
 }
 
+/// Visit every logical index of `shape` in row-major order.
+///
+/// Empty tensors produce no visits; a rank-0 shape produces exactly one visit
+/// with an empty index slice.
 pub fn for_each_index(shape: &[usize], mut f: impl FnMut(&[usize])) {
     if shape.contains(&0) {
         return;
@@ -197,7 +219,6 @@ mod tests {
         );
     }
 }
-
 
 /// Iterate row-major over `shape`, yielding the *storage offset* of each element.
 ///
@@ -273,7 +294,6 @@ pub fn for_each_run(
     let outer_strides = &strides[..split];
     for_each_offset(base, outer_shape, outer_strides, |off| f(off, run));
 }
-
 
 /// Cache-blocked copy of a strided view into a contiguous buffer.
 ///

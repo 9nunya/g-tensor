@@ -1,4 +1,29 @@
 //! Core tensor types, errors, and view/construction ops.
+//!
+//! This is the foundation crate of [`g`](https://docs.rs/g). It owns the
+//! runtime-rank [`Tensor`], the element types ([`Dtype`]), the placement
+//! marker ([`Device`]), the shared error type ([`Error`]), and the low-level
+//! shape/striding machinery that all kernels are built on.
+//!
+//! # Tensors are cheap views
+//!
+//! A [`Tensor`] is a reference-counted handle over a shared [`Storage`] buffer
+//! plus a shape, strides, and an offset. Cloning a tensor is O(1): it does not
+//! copy bytes. Views such as [`Tensor::slice`], [`Tensor::permute`], and
+//! [`Tensor::broadcast_to`] only adjust metadata. Use [`Tensor::to_contiguous`]
+//! or [`Tensor::copy`] when you need a packed, uniquely-owned buffer.
+//!
+//! # Reverse AD
+//!
+//! Tensors carry optional graph metadata ([`Backward`] nodes and leaf
+//! accumulators) so the `g-ad` crate can run a first-order reverse pass. The
+//! core crate itself never differentiates; it just stores the wiring.
+//!
+//! # Dtypes
+//!
+//! [`Dtype::F32`] is the default compute type, [`Dtype::F64`] is available for
+//! reference checks, and [`Dtype::I64`] is used for integer indices. Most
+//! kernels are float-only in v1.
 
 mod backward;
 mod construct;
@@ -15,8 +40,8 @@ pub use device::Device;
 pub use dtype::Dtype;
 pub use error::{Error, ErrorKind, Result};
 pub use shape::{
-    broadcast_shapes, broadcast_strides, for_each_index, for_each_offset, for_each_run, strided_copy,
-    normalize_axis, numel, offset_of, resolve_reshape, row_major_strides,
+    broadcast_shapes, broadcast_strides, for_each_index, for_each_offset, for_each_run,
+    normalize_axis, numel, offset_of, resolve_reshape, row_major_strides, strided_copy,
 };
 pub use storage::{Storage, StorageData};
 pub use tensor::{Leaf, Tensor};

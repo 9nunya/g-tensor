@@ -19,11 +19,18 @@ fn fused_sigmoid_and_silu_grads_match_fd() {
     let w: Vec<f32> = (0..n).map(|i| 0.3 + (i % 5) as f32 * 0.1).collect();
     let wt = Tensor::from_vec_f32(w, &[n]).unwrap();
 
-    for (name, op) in [("sigmoid", g::sigmoid as fn(&Tensor) -> g::Result<Tensor>),
-                       ("silu", g::silu as fn(&Tensor) -> g::Result<Tensor>)] {
+    for (name, op) in [
+        ("sigmoid", g::sigmoid as fn(&Tensor) -> g::Result<Tensor>),
+        ("silu", g::silu as fn(&Tensor) -> g::Result<Tensor>),
+    ] {
         let obj = |x: &Tensor| -> f64 {
             let y = op(x).unwrap();
-            g::mul(&y, &wt).unwrap().sum(None, false).unwrap().to_vec_f32().unwrap()[0] as f64
+            g::mul(&y, &wt)
+                .unwrap()
+                .sum(None, false)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap()[0] as f64
         };
         let xg = x0.clone().with_requires_grad();
         let y = op(&xg).unwrap();
@@ -33,8 +40,10 @@ fn fused_sigmoid_and_silu_grads_match_fd() {
         let base = x0.to_vec_f32().unwrap();
         let mut ng = vec![0f32; n];
         for i in 0..n {
-            let mut pp = base.clone(); pp[i] += h;
-            let mut mm = base.clone(); mm[i] -= h;
+            let mut pp = base.clone();
+            pp[i] += h;
+            let mut mm = base.clone();
+            mm[i] -= h;
             let fp = obj(&Tensor::from_vec_f32(pp, &[n]).unwrap());
             let fm = obj(&Tensor::from_vec_f32(mm, &[n]).unwrap());
             ng[i] = ((fp - fm) / (2.0 * h as f64)) as f32;
