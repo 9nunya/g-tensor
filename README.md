@@ -1,5 +1,8 @@
 # g
 
+[![Crates.io](https://img.shields.io/crates/v/g-tensor.svg)](https://crates.io/crates/g-tensor)
+[![docs.rs](https://img.shields.io/docsrs/g-tensor)](https://docs.rs/g-tensor)
+
 A Rust tensor and ML library for **Apple Silicon** and Intel Macs with Metal,
 designed to feel as easy as PyTorch without copying its API.
 
@@ -7,6 +10,19 @@ v1 is **CPU-first**. On an M3 Air, representative PC/training MLP forwards are
 faster on the CPU than on naive Metal. Large GEMMs can use MPSGraph when you
 build with `--features gpu`; on a multi-GPU machine the backend splits one
 large GEMM across every Metal device **and** the CPU in parallel.
+
+## Install
+
+The umbrella crate is published as `g-tensor` on crates.io (the `g` package
+name was already taken), but the library import path is still `g`:
+
+```toml
+[dependencies]
+g-tensor = "0.1"
+```
+
+Individual crates (`g-core`, `g-cpu`, `g-ad`, `g-nn`, `g-apple`) are also
+published separately if you only need a subset of the stack.
 
 ```rust
 use g::prelude::*;
@@ -46,20 +62,19 @@ No Python. No PyTorch clone. No CUDA. No iOS. ANE is not a supported device.
 ## Docs
 
 ```bash
-cargo doc -p g --no-deps --open
+cargo doc -p g-tensor --no-deps --open
 ```
 
-That is the API reference (every public fn/type). There is no docs.rs page because
-the crate is not published.
+Also published at [docs.rs/g-tensor](https://docs.rs/g-tensor).
 
 ## Build
 
 ```bash
 cargo test --workspace
-cargo run -p g --example mlp
-cargo run -p g --example pc_local
+cargo run -p g-tensor --example mlp
+cargo run -p g-tensor --example pc_local
 cargo test -p g-cpu --features accelerate --lib
-cargo test -p g --features gpu --test gpu_gemm   # large 1024 GEMM
+cargo test -p g-tensor --features gpu --test gpu_gemm   # large 1024 GEMM
 ```
 
 MSRV: current stable. License: MIT OR Apache-2.0.
@@ -80,17 +95,17 @@ reports the devices actually used for GEMMs.
 ## Examples
 
 ```bash
-cargo run -p g --example mlp              # MLP regression
-cargo run -p g --example classify_blobs   # 3-class CE
-cargo run -p g --example autoencoder
-cargo run -p g --example adamw_sine       # fit sin(x) with AdamW
-cargo run -p g --example bandit           # softmax Bernoulli bandit
-cargo run -p g --example reinforce_cartpole
-cargo run -p g --example ppo_cartpole     # clipped PPO
-cargo run -p g --example dqn_gridworld
-cargo run -p g --example pc_local         # local PC energy
-cargo run -p g --example pc_train         # PC inference + Hebbian update
-cargo run -p g --example attention_toy    # 2-token attention
+cargo run -p g-tensor --example mlp              # MLP regression
+cargo run -p g-tensor --example classify_blobs   # 3-class CE
+cargo run -p g-tensor --example autoencoder
+cargo run -p g-tensor --example adamw_sine       # fit sin(x) with AdamW
+cargo run -p g-tensor --example bandit           # softmax Bernoulli bandit
+cargo run -p g-tensor --example reinforce_cartpole
+cargo run -p g-tensor --example ppo_cartpole     # clipped PPO
+cargo run -p g-tensor --example dqn_gridworld
+cargo run -p g-tensor --example pc_local         # local PC energy
+cargo run -p g-tensor --example pc_train         # PC inference + Hebbian update
+cargo run -p g-tensor --example attention_toy    # 2-token attention
 ```
 
 

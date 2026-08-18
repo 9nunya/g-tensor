@@ -6,7 +6,7 @@ license.workspace = true
 publish = true
 rust-version.workspace = true
 description = "Autodiff engine for the g tensor library"
-repository = "https://github.com/9nunya/G"
+repository = "https://github.com/9nunya/g-tensor"
 
 [features]
 default = []
