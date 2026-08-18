@@ -3,7 +3,9 @@ name = "g-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+publish = true
 rust-version.workspace = true
+description = "Core tensor types, shapes and storage for the g tensor library"
+repository = "https://github.com/9nunya/G"
 
 [dependencies]

@@ -17,9 +17,9 @@ publish = false
 rust-version = "1.85"
 
 [workspace.dependencies]
-g-core = { path = "crates/g-core" }
-g-cpu = { path = "crates/g-cpu" }
-g-ad = { path = "crates/g-ad" }
-g-nn = { path = "crates/g-nn" }
-g-apple = { path = "crates/g-apple" }
+g-core = { path = "crates/g-core", version = "0.1.0" }
+g-cpu = { path = "crates/g-cpu", version = "0.1.0" }
+g-ad = { path = "crates/g-ad", version = "0.1.0" }
+g-nn = { path = "crates/g-nn", version = "0.1.0" }
+g-apple = { path = "crates/g-apple", version = "0.1.0" }
 rayon = "1.10"
