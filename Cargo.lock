@@ -40,17 +40,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
-name = "g"
-version = "0.1.0"
-dependencies = [
- "g-ad",
- "g-apple",
- "g-core",
- "g-cpu",
- "g-nn",
-]
-
-[[package]]
 name = "g-ad"
 version = "0.1.0"
 dependencies = [
@@ -90,6 +79,17 @@ dependencies = [
  "g-ad",
  "g-core",
  "g-cpu",
+]
+
+[[package]]
+name = "g-tensor"
+version = "0.1.0"
+dependencies = [
+ "g-ad",
+ "g-apple",
+ "g-core",
+ "g-cpu",
+ "g-nn",
 ]
 
 [[package]]
